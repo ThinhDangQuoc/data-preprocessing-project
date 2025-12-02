@@ -310,17 +310,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-print(pl.read_parquet('features.parquet').head())
-
-
-'''python feature_builder.py \
-  --transactions "recommendation dataset/sales_pers.purchase_history_daily_chunk_*.parquet" \
-  --items "recommendation dataset/sales_pers.item_chunk_0.parquet" \
-  --users "recommendation dataset/sales_pers.user_chunk_0.parquet" \
-  --begin-hist 2000-01-01 --end-hist 2100-01-01 \   
-  --begin-recent 2024-04-01 --end-recent 2024-04-30 \
-  --transaction-col created_date \
-  --customer-col user_id \
-  --out features.parquet
-'''
