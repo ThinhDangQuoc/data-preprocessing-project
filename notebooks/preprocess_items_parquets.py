@@ -321,7 +321,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset_dir", required=True, help="Directory containing many item_chunk_*.parquet")
     ap.add_argument("--out_dir", required=True, help="Where to write processed outputs")
-    ap.add_argument("--pattern", default="item_chunk_*.parquet", help="Glob pattern to match item parquet files")
+    ap.add_argument("--pattern", default="sales_pers.item_chunk_*.parquet", help="Glob pattern to match item parquet files")
     ap.add_argument("--iqr_factor", type=float, default=1.5, help="IQR factor for outlier capping (price)")
     ap.add_argument("--low_cardinality_threshold", type=int, default=LOW_CARD_DEFAULT_THRESHOLD,
                     help="<= threshold → OHE; > threshold → frequency encoding")

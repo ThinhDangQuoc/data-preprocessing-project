@@ -1,42 +1,20 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# -- coding: utf-8 --
 
 """
 Preprocess user parquet chunks (Task 1 -> Task 4).
 
-Supports:
-  - Single file: --parquet /path/to/sales_pers.user_chunk_0.parquet
-  - Directory:   --dataset_dir /path --pattern "sales_pers.user_chunk_*.parquet"
-
-Pipeline:
-  Task 1: Drop unneeded/meta columns; prefer `user_id` over `customer_id`
-  Task 2: NULL handling (objects -> 'Unknown', numerics -> median)
-  Task 3: Redundancy checks; convert numeric-coded categoricals to categorical
-  Task 4: Normalize numeric (except IDs/timestamps/date cols) & encode categoricals
-          - OHE for low-card (<= threshold)
-          - Frequency encoding for high-card
-
-Outputs (in --out_dir):
-  - <same_basename>.parquet           (processed per-file)
-  - user_transformers.joblib          (global scaler, OHE list, freq mappings)
-  - user_drop_report.json
-  - user_cardinality.json
-  - user_corr_report.csv              (optional; last file scanned)
+Updates:
+- Keeps BOTH user_id and customer_id (does not drop customer_id).
+- Excludes both IDs from scaling and categorical encoding.
 
 Usage examples:
-  # Single file
-  python preprocess_user.py \
-    --parquet /content/data/sales_pers.user_chunk_0.parquet \
-    --out_dir /content/out_user \
-    --write_corr
 
-  # Directory (consistent encoders across all chunks)
-  python preprocess_user.py \
-    --dataset_dir /content/data \
-    --pattern "sales_pers.user_chunk_*.parquet" \
-    --out_dir /content/out_user \
-    --concat_all \
-    --write_corr
+Single file:
+python preprocess_user.py --parquet /content/data/sales_pers.user_chunk_0.parquet --out_dir /content/out_user --write_corr
+
+Directory:
+python preprocess_user.py --dataset_dir /content/data --pattern "sales_pers.user_chunk_*.parquet" --out_dir /content/out_user --concat_all --write_corr
 """
 
 import argparse
@@ -50,10 +28,7 @@ from joblib import dump
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
-# --------------------------
 # Config
-# --------------------------
-
 LOW_CARD_DEFAULT_THRESHOLD = 20
 
 # Drop these system/meta columns if present
@@ -66,12 +41,10 @@ USER_DROP_ALWAYS = [
     "is_deleted",
 ]
 
-# We keep created_date for future featurization (recency), but exclude from scaling/encoding in this script.
+# We keep created_date for future featurization (recency), but exclude from scaling/encoding.
 OBJ_EXCLUDE = []  # add any free-text columns you want to keep raw
 
-# --------------------------
-# Helpers
-# --------------------------
+# --- Helpers ---
 
 def read_parquet(p: Path) -> pd.DataFrame:
     return pd.read_parquet(p)
@@ -107,7 +80,7 @@ def looks_like_user_file(path: Path, pattern_glob: str) -> bool:
 def detect_numeric_categoricals(df: pd.DataFrame, max_ratio: float = 0.001, max_abs: int = 64) -> List[str]:
     """
     Heuristic: numeric columns that behave like categorical codes (e.g., 'location').
-    - if nunique / rows <= max_ratio OR nunique <= max_abs  => treat as categorical
+    if nunique / rows <= max_ratio OR nunique <= max_abs  => treat as categorical
     """
     candidates = []
     n = max(1, len(df))
@@ -127,28 +100,30 @@ def one_hot_low_card(df: pd.DataFrame, ohe_cols: List[str]) -> pd.DataFrame:
 def apply_frequency_mapping(series: pd.Series, mapping: Dict[str, float]) -> pd.Series:
     return series.astype(str).map(mapping).fillna(0.0)
 
-# --------------------------
-# Core per-file cleaning (Tasks 1 & 2 & 3 prep)
-# --------------------------
+# --- Core per-file cleaning ---
 
 def clean_user_file(df: pd.DataFrame, iqr_factor: float, drop_report: Dict) -> pd.DataFrame:
+    
     # Task 1: drop system/meta
     to_drop = [c for c in USER_DROP_ALWAYS if c in df.columns]
     if to_drop:
         df = df.drop(columns=to_drop, errors="ignore")
         drop_report.setdefault("dropped_system_meta", []).extend(to_drop)
 
-    # Prefer user_id over customer_id (keep user_id for joins with purchases)
-    if "customer_id" in df.columns and "user_id" in df.columns:
-        df = df.drop(columns=["customer_id"])
+    # MODIFICATION: We do NOT drop customer_id here anymore.
+    # We keep both user_id and customer_id if they exist.
 
     # Task 2: NULL handling
     for c in df.select_dtypes(include=["object"]).columns:
         if df[c].isna().any():
             df[c] = df[c].fillna("Unknown")
+            
     for c in df.select_dtypes(include=[np.number]).columns:
         if df[c].isna().any():
-            df[c] = df[c].fillna(df[c].median())
+            # If it's a numeric ID, we should technically avoid filling with median, 
+            # but usually IDs aren't null. If they are, median is risky, but we keep logic consistent.
+            if not is_id_or_ts_or_date(c):
+                df[c] = df[c].fillna(df[c].median())
 
     # Task 2: Outlier capping (mostly not needed here; clip small numeric fields if present)
     for c in df.select_dtypes(include=[np.number]).columns:
@@ -177,12 +152,14 @@ def update_global_cardinality_and_freq(
         if c in obj_cols_exclude or c in id_like_cols:
             continue
         vc = df[c].value_counts(dropna=False)
+
         # cardinality
         global_cardinality[c] = max(global_cardinality.get(c, 0), int(vc.shape[0]))
+
         # counts for frequency mapping
         g = global_freq_counts.setdefault(c, {})
         for k, v in vc.items():
-            key = str(k) if pd.notna(k) else "__NA__"
+            key = str(k) if pd.notna(k) else "NA"
             g[key] = g.get(key, 0) + int(v)
 
 def build_freq_mappings(global_freq_counts: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, float]]:
@@ -192,9 +169,7 @@ def build_freq_mappings(global_freq_counts: Dict[str, Dict[str, int]]) -> Dict[s
         mappings[col] = {k: v / total for k, v in cnts.items()}
     return mappings
 
-# --------------------------
-# Two-pass processing (dir mode) for consistent encoders/scaler
-# --------------------------
+# --- Processing Functions ---
 
 def process_dir(
     dataset_dir: str,
@@ -221,8 +196,9 @@ def process_dir(
 
     scaler = StandardScaler(with_mean=True, with_std=True)
     scaler_fitted = False
-
-    id_like_cols = ["user_id"]  # we already drop customer_id
+    
+    # MODIFICATION: explicitly exclude both IDs from OHE/Freq encoding
+    id_like_cols = ["user_id", "customer_id"]
 
     # ---------- PASS 1: fit global stats ----------
     for fp in tqdm(files, desc="Pass 1/2 (fit)"):
@@ -230,6 +206,8 @@ def process_dir(
         df = clean_user_file(df, iqr_factor=iqr_factor, drop_report=drop_report)
 
         if write_corr:
+            # We only write corr for the last file scanned or similar, 
+            # effectively checking correlation in chunks
             num_corr = df.select_dtypes(include=[np.number]).corr()
             num_corr.to_csv(out / "user_corr_report.csv")
 
@@ -311,13 +289,13 @@ def process_dir(
 
     if concat_all:
         dfs = [pd.read_parquet(p) for p in processed_paths]
-        pd.concat(dfs, axis=0, ignore_index=True).to_parquet(out / "user_all_processed.parquet", index=False)
+        if dfs:
+            pd.concat(dfs, axis=0, ignore_index=True).to_parquet(out / "user_all_processed.parquet", index=False)
+            print(f"Concatenated: {out/'user_all_processed.parquet'}")
 
     print("\n=== DONE (Task 1-4 for user chunks) ===")
     print(f"Files processed: {len(processed_paths)}")
     print(f"Saved to: {out}")
-    if concat_all:
-        print(f"Concatenated: {out/'user_all_processed.parquet'}")
 
 
 def process_single_file(parquet_path: str, out_dir: str, iqr_factor: float,
@@ -347,7 +325,9 @@ def process_single_file(parquet_path: str, out_dir: str, iqr_factor: float,
         df[numeric_for_scaling] = scaler.fit_transform(df[numeric_for_scaling])
 
     # cardinality
-    id_like_cols = ["user_id"]
+    # MODIFICATION: exclude both IDs from cardinality checks
+    id_like_cols = ["user_id", "customer_id"]
+    
     cardinality = {c: df[c].nunique(dropna=False) for c in obj_cols if c not in OBJ_EXCLUDE and c not in id_like_cols}
     ohe_cols = sorted([c for c, k in cardinality.items() if k <= low_cardinality_threshold])
     freq_cols = sorted([c for c, k in cardinality.items() if k > low_cardinality_threshold])
@@ -357,7 +337,7 @@ def process_single_file(parquet_path: str, out_dir: str, iqr_factor: float,
     for c in freq_cols:
         vc = df[c].value_counts(dropna=False)
         total = float(vc.sum()) or 1.0
-        freq_mappings[c] = {str(k) if pd.notna(k) else "__NA__": v / total for k, v in vc.items()}
+        freq_mappings[c] = {str(k) if pd.notna(k) else "NA": v / total for k, v in vc.items()}
         df[c] = apply_frequency_mapping(df[c], freq_mappings[c])
 
     # one-hot
@@ -394,14 +374,14 @@ def process_single_file(parquet_path: str, out_dir: str, iqr_factor: float,
     print("\n=== DONE (Task 1-4 single user file) ===")
     print(f"Saved: {out_path}")
 
-
 def main():
     ap = argparse.ArgumentParser()
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--parquet", help="Path to a single user chunk parquet")
     mode.add_argument("--dataset_dir", help="Directory containing many user chunks")
+    
     ap.add_argument("--out_dir", required=True, help="Output directory")
-    ap.add_argument("--pattern", default="*user_chunk_*.parquet",
+    ap.add_argument("--pattern", default="user_chunk_*.parquet",
                     help="Glob pattern for directory mode (used with --dataset_dir)")
     ap.add_argument("--iqr_factor", type=float, default=1.5, help="IQR factor for outlier capping (light)")
     ap.add_argument("--low_cardinality_threshold", type=int, default=LOW_CARD_DEFAULT_THRESHOLD,
