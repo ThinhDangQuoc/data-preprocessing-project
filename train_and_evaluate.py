@@ -2,21 +2,13 @@ from __future__ import annotations
 import pickle
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Tuple, List, Any, Optional
+from typing import Dict, Tuple, List, Any
 import numpy as np
 import polars as pl
-import warnings
-
-# --- MODELS ---
 from xgboost import XGBClassifier
-from lightgbm import LGBMClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.linear_model import SGDClassifier # Fast approximation for SVM
 from sklearn.preprocessing import StandardScaler
-from sklearn.impute import SimpleImputer
-from sklearn.pipeline import Pipeline
-
+import warnings
 warnings.filterwarnings('ignore')
 
 # Import your enhanced feature builder
@@ -27,8 +19,8 @@ TRANSACTIONS_GLOB = "/workingspace_aiclub/WorkingSpace/Personal/quannh/Project/r
 ITEMS_PATH = "/workingspace_aiclub/WorkingSpace/Personal/quannh/Project/recommend_system/dataset/sales_pers.item_chunk_0.parquet"
 USERS_GLOB = "/workingspace_aiclub/WorkingSpace/Personal/quannh/Project/recommend_system/dataset/sales_pers.user_chunk*.parquet"
 
+# Define the number of features created in builder
 NUM_FEATURES = 29 
-RANK_KS = (5, 10, 20)
 
 @dataclass(frozen=True)
 class FeatureWindow:
@@ -58,247 +50,258 @@ TEST_WINDOW = FeatureWindow(
     recent_end=datetime(2024, 12, 19),
 )
 
-# --- UTILS ---
-def generate_ground_truth(transactions: pl.LazyFrame, window: FeatureWindow) -> Dict[Any, Dict[str, List[Any]]]:
+RANK_KS = (5, 10, 20)
+
+# --- NEW: DYNAMIC GROUND TRUTH GENERATOR ---
+def generate_ground_truth(
+    transactions: pl.LazyFrame, 
+    window: FeatureWindow,
+    customer_col: str = "customer_id",
+    item_col: str = "item_id",
+    time_col: str = "created_date"
+) -> Dict[Any, Dict[str, List[Any]]]:
+    """
+    Generates ground truth from the transactions that occurred during the 
+    'recent' (target) period of the provided window.
+    """
+    print(f"Generating Ground Truth for window: {window.recent_start} to {window.recent_end}")
+    
     gt_df = (
         transactions
-        .filter(pl.col("created_date") >= window.recent_start)
-        .filter(pl.col("created_date") <= window.recent_end)
-        .select(["customer_id", "item_id"])
-        .unique()
-        .group_by("customer_id")
-        .agg(pl.col("item_id").alias("list_items"))
+        .filter(pl.col(time_col) >= window.recent_start)
+        .filter(pl.col(time_col) <= window.recent_end)
+        .select([customer_col, item_col])
+        .unique() # We care if they bought the item, not how many times (for Precision@K)
+        .group_by(customer_col)
+        .agg(pl.col(item_col).alias("list_items"))
         .collect()
     )
-    return {row["customer_id"]: {"list_items": row["list_items"]} for row in gt_df.iter_rows(named=True)}
+    
+    # Format: {customer_id: {'list_items': [item_id, item_id, ...]}}
+    gt_dict = {}
+    for row in gt_df.iter_rows(named=True):
+        gt_dict[row[customer_col]] = {"list_items": row["list_items"]}
+        
+    print(f"Ground truth generated for {len(gt_dict)} users.")
+    return gt_dict
 
+# --- EVALUATION LOGIC ---
 def precision_at_k(pred, gt, hist, filter_bought_items=True, K=10):
     precisions = []
+    ncold_start = 0
+    cold_start_users = []
+    
     for user in gt.keys():
+        # Check if user exists in our prediction set
         if user not in pred:
+            # If the user is in GT but not in Pred, it usually means 
+            # we didn't generate candidates for them (Cold Start or filtering).
+            # We count this as 0 precision.
             precisions.append(0.0)
+            ncold_start += 1
+            cold_start_users.append(user)
             continue
         
-        gt_items = set(gt[user]['list_items'])
+        gt_items = gt[user]['list_items']
+        relevant_items = set(gt_items)
+        
+        # Filter items already seen in history (if configured)
         if filter_bought_items and user in hist:
-            gt_items -= set(hist[user])
+            relevant_items -= set(hist[user])
             
-        if not gt_items: continue # Skip if no relevant items left
-        if not pred[user]: 
+        # If no relevant items remain after filtering (e.g. user only bought rebuy items), skip
+        if len(relevant_items) == 0:
+            continue
+        
+        if len(pred[user]) == 0:
             precisions.append(0.0)
             continue
             
-        hits = len(set(pred[user][:K]) & gt_items)
+        hits = len(set(pred[user][:K]) & relevant_items)
         precisions.append(hits / K)
     
-    return np.mean(precisions) if precisions else 0.0
+    if not precisions:
+        return 0.0, cold_start_users
+    return np.mean(precisions), cold_start_users
 
+# --- PIPELINE FUNCTIONS ---
 def _scan_sources() -> Tuple[pl.LazyFrame, pl.LazyFrame, pl.LazyFrame]:
-    return pl.scan_parquet(TRANSACTIONS_GLOB), pl.scan_parquet(ITEMS_PATH), pl.scan_parquet(USERS_GLOB)
+    transactions = pl.scan_parquet(TRANSACTIONS_GLOB)
+    items = pl.scan_parquet(ITEMS_PATH)
+    users = pl.scan_parquet(USERS_GLOB)
+    return transactions, items, users
 
-def _build_table(window: FeatureWindow, transactions, items, users) -> pl.DataFrame:
-    print(f"Building table: H({window.history_start.date()}-{window.history_end.date()}) -> T({window.recent_start.date()})")
+def _build_table(
+    window: FeatureWindow,
+    *,
+    transactions: pl.LazyFrame,
+    items: pl.LazyFrame,
+    users: pl.LazyFrame
+) -> pl.DataFrame:
+    print(f"Building table for window: History {window.history_start}-{window.history_end} | Target {window.recent_start}-{window.recent_end}")
     return build_feature_label_table(
-        transactions, items, users,
-        window.history_start, window.history_end,
-        window.recent_start, window.recent_end,
+        transactions,
+        items,
+        users,
+        window.history_start,
+        window.history_end,
+        window.recent_start,
+        window.recent_end,
         transaction_time_col="created_date",
         customer_id_col="customer_id",
-        price_col="price", quantity_col="quantity"
+        price_col="price",
+        quantity_col="quantity"
     ).collect()
 
 def extract_features(table: pl.DataFrame) -> np.ndarray:
-    return table.select([f"X_{i}" for i in range(1, NUM_FEATURES + 1)]).to_numpy().astype(np.float64)
+    feature_cols = [f"X_{i}" for i in range(1, NUM_FEATURES + 1)]
+    return table.select(feature_cols).to_numpy().astype(np.float64)
 
-# --- MODULAR TRAINING FUNCTION ---
-
-def get_model_pipeline(model_type: str, scale_pos_weight: float) -> Any:
-    """Returns a scikit-learn compatible pipeline or model based on type."""
-    
-    # 1. XGBoost (Gradient Boosting)
-    if model_type == "xgboost":
-        return XGBClassifier(
-            n_estimators=1000, learning_rate=0.05, max_depth=6,
-            min_child_weight=5, subsample=0.8, colsample_bytree=0.8,
-            scale_pos_weight=scale_pos_weight, random_state=42, n_jobs=-1,
-            eval_metric='logloss', early_stopping_rounds=50
-        )
-
-    # 2. LightGBM (Gradient Boosting - often faster/better than XGB)
-    elif model_type == "lgbm":
-        return LGBMClassifier(
-            n_estimators=1000, learning_rate=0.05, max_depth=8,
-            num_leaves=31, scale_pos_weight=scale_pos_weight, 
-            random_state=42, n_jobs=-1, verbose=-1,
-            early_stopping_rounds=50
-        )
-
-    # 3. Logistic Regression (Linear)
-    # Needs Imputation and Scaling
-    elif model_type == "logistic":
-        return Pipeline([
-            ('imputer', SimpleImputer(strategy='mean')),
-            ('scaler', StandardScaler()),
-            ('clf', LogisticRegression(
-                solver='liblinear', 
-                class_weight='balanced', 
-                random_state=42,
-                max_iter=1000
-            ))
-        ])
-
-    # 4. SVM (Support Vector Machine)
-    # Standard SVC is O(N^3) and too slow for large RecSys.
-    # We use SGDClassifier with loss='modified_huber' which approximates SVM 
-    # but supports predict_proba and is O(N).
-    elif model_type == "svm":
-        return Pipeline([
-            ('imputer', SimpleImputer(strategy='mean')),
-            ('scaler', StandardScaler()),
-            ('clf', SGDClassifier(
-                loss='modified_huber', # Allows probability estimates
-                penalty='l2',
-                alpha=1e-4, 
-                class_weight='balanced',
-                random_state=42,
-                max_iter=1000,
-                n_jobs=-1
-            ))
-        ])
-
-    # 5. Decision Tree (Simple rule-based)
-    elif model_type == "tree":
-        return DecisionTreeClassifier(
-            max_depth=10, 
-            min_samples_leaf=20,
-            class_weight='balanced', 
-            random_state=42
-        )
-
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
-
-def train_model_generic(
+def train_model(
     train_table: pl.DataFrame, 
-    model_type: str,
+    model_type: str = "xgboost",
     val_table: pl.DataFrame = None
-) -> Any:
+) -> Tuple[Any, StandardScaler]:
     
-    print(f"  -> Training {model_type.upper()}...")
+    print("  -> Preprocessing training data...")
     X = extract_features(train_table)
     y = train_table["Y"].to_numpy()
     
-    # Calculate Class Balance
+    # Calculate scale_pos_weight for imbalance
     pos_count = (y == 1).sum()
     neg_count = (y == 0).sum()
     scale_pos_weight = neg_count / pos_count if pos_count > 0 else 1.0
+    print(f"  -> Class balance: {neg_count} Neg, {pos_count} Pos. Scale Weight: {scale_pos_weight:.2f}")
     
-    # Get model structure
-    model = get_model_pipeline(model_type, scale_pos_weight)
+    scaler = StandardScaler()
+    scaler.fit(X) 
     
-    # Fit Logic
-    if model_type in ["xgboost", "lgbm"]:
-        # GBMs support native validation sets
-        eval_set = None
-        if val_table is not None:
-            X_val = extract_features(val_table)
-            y_val = val_table["Y"].to_numpy()
-            eval_set = [(X_val, y_val)]
-        
-        # XGBoost requires eval_set to be list of tuples, LGBM same
-        # Note: Scikit-Learn pipelines don't take eval_set in fit easily
-        model.fit(X, y, eval_set=eval_set)
-        
-    else:
-        # Sklearn models (Logistic, SVM, Tree) don't use eval_set for early stopping 
-        # in the standard API (SGD does support partial_fit but let's keep it simple)
-        model.fit(X, y)
+    eval_set = None
+    if val_table is not None:
+        X_val = extract_features(val_table)
+        y_val = val_table["Y"].to_numpy()
+        eval_set = [(X, y), (X_val, y_val)]
+    
+    print("  -> Starting XGBoost training...")
+    model = XGBClassifier(
+        n_estimators=1000,
+        learning_rate=0.05,
+        max_depth=6,
+        min_child_weight=5,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        scale_pos_weight=scale_pos_weight,
+        random_state=42,
+        n_jobs=-1,
+        eval_metric='logloss',
+        early_stopping_rounds=50 if eval_set else None
+    )
+    
+    fit_params = {'verbose': False}
+    if eval_set:
+        fit_params['eval_set'] = eval_set
+    
+    model.fit(X, y, **fit_params)
+    
+    if eval_set and hasattr(model, 'best_iteration'):
+        print(f"  -> Best iteration: {model.best_iteration}")
 
-    return model
-
-def score_table(model: Any, table: pl.DataFrame) -> pl.DataFrame:
+    # --- FEATURE IMPORTANCE WITH PERCENTAGES ---
+    importances = model.feature_importances_
+    feature_names = [f"X_{i}" for i in range(1, NUM_FEATURES + 1)]
+    
+    # Sort indices descending
+    sorted_indices = np.argsort(importances)[::-1]
+    
+    print(f"\n  -> Top 10 Feature Importances:")
+    for i in range(min(10, len(importances))):
+        idx = sorted_indices[i]
+        imp_percent = importances[idx] * 100
+        print(f"     {feature_names[idx]}: {imp_percent:.2f}%")
+        
+    
+    return model, scaler
+def score_table(model: Any, scaler: StandardScaler, table: pl.DataFrame) -> pl.DataFrame:
     X = extract_features(table)
-    # Handle Pipeline vs raw model
-    if hasattr(model, "predict_proba"):
-        scores = model.predict_proba(X)[:, 1]
-    else:
-        # Fallback if probability not supported (shouldn't happen with this setup)
-        scores = model.decision_function(X) 
-        
+    scores = model.predict_proba(X)[:, 1]
     return table.with_columns(pl.Series("score", scores))
 
 def _build_history_dict(transactions: pl.LazyFrame, window: FeatureWindow) -> Dict[Any, List[Any]]:
+    # Items bought BEFORE the prediction window (History)
+    # Used to filter out items user has already bought if we want purely new recommendations
     hist_df = (
         transactions
         .filter(pl.col("created_date") < window.recent_start) 
         .select(["customer_id", "item_id"])
         .unique()
+        .group_by("customer_id")
+        .agg(pl.col("item_id"))
         .collect()
     )
-    # Optimized grouping
-    return {k: list(v) for k, v in hist_df.group_by("customer_id", maintain_order=False).agg("item_id").iter_rows()}
+    hist_dict = {cid: items.to_list() for cid, items in zip(hist_df["customer_id"], hist_df["item_id"])}
+    return hist_dict
 
 def _build_prediction_dict(scored: pl.DataFrame, max_k: int) -> Dict[Any, List[Any]]:
+    # Get top K items per user based on score
     pred_df = (
         scored
         .sort(["X-1", "score"], descending=[False, True])
         .group_by("X-1")
         .agg(pl.col("X_0").head(max_k))
     )
-    return {row["X-1"]: row["X_0"] for row in pred_df.iter_rows(named=True)}
-
-# --- MAIN ---
+    pred_dict = {cid: items.to_list() for cid, items in zip(pred_df["X-1"], pred_df["X_0"])}
+    return pred_dict
 
 def main() -> None:
     transactions, items, users = _scan_sources()
     
-    # 1. Build Data
-    train_table = _build_table(TRAIN_WINDOW, transactions, items, users)
-    val_table = _build_table(VAL_WINDOW, transactions, items, users)
-    test_table = _build_table(TEST_WINDOW, transactions, items, users)
+    # 1. Build Data Tables
+    # We do not use ground truth for Training, only for final Evaluation
+    print("\n--- 1. Building Feature Tables ---")
+    train_table = _build_table(TRAIN_WINDOW, transactions=transactions, items=items, users=users)
+    val_table = _build_table(VAL_WINDOW, transactions=transactions, items=items, users=users)
     
-    # 2. Evaluation Setup
-    test_ground_truth = generate_ground_truth(transactions, TEST_WINDOW)
+    # 2. Train Model
+    print("\n--- 2. Training Model ---")
+    model, scaler = train_model(
+        train_table, 
+        model_type="xgboost",
+        val_table=val_table
+    )
+    
+    # 3. Prepare Test Data
+    print("\n--- 3. Preparing Test Evaluation ---")
+    test_table = _build_table(TEST_WINDOW, transactions=transactions, items=items, users=users)
+    
+    # --- HERE IS THE CHANGE ---
+    # Generate Ground Truth dynamically for the Test Window
+    test_ground_truth = generate_ground_truth(
+        transactions, 
+        TEST_WINDOW,
+        customer_col="customer_id",
+        item_col="item_id",
+        time_col="created_date"
+    )
+    
+    # 4. Score Test Data
+    print("\n--- 4. Scoring Test Data ---")
+    scored_test = score_table(model, scaler, test_table)
+    
+    # 5. Evaluate
+    print(f"\n--- 5. Final Evaluation on Test Window ({TEST_WINDOW.recent_start.date()} - {TEST_WINDOW.recent_end.date()}) ---")
+    
+    # Build history dict to optionally filter out items the user has bought in the past
+    # (depending on business logic, usually we filter them out for discovery)
     hist_dict = _build_history_dict(transactions, TEST_WINDOW)
     
-    # 3. Model Loop
-    models_to_run = ["logistic", "tree", "xgboost", "lgbm", "svm"]
-    results = {}
-
-    print(f"\n{'='*10} STARTING MODEL COMPARISON {'='*10}")
-
-    for m_name in models_to_run:
-        print(f"\n>>> Running: {m_name}")
-        
-        # Train
-        try:
-            model = train_model_generic(train_table, m_name, val_table)
-            
-            # Score
-            scored_test = score_table(model, test_table)
-            
-            # Evaluate
-            pred_dict = _build_prediction_dict(scored_test, 20)
-            
-            metrics = {}
-            for k in RANK_KS:
-                p = precision_at_k(pred_dict, test_ground_truth, hist_dict, filter_bought_items=True, K=k)
-                metrics[f"P@{k}"] = p
-            
-            results[m_name] = metrics
-            print(f"    Scores: {metrics}")
-            
-        except Exception as e:
-            print(f"    Failed to run {m_name}: {e}")
-            import traceback
-            traceback.print_exc()
-
-    # 4. Final Summary
-    print(f"\n{'='*10} FINAL SUMMARY {'='*10}")
-    print(f"{'Model':<15} | {'P@5':<10} | {'P@10':<10} | {'P@20':<10}")
-    print("-" * 55)
-    for m_name, metrics in results.items():
-        print(f"{m_name:<15} | {metrics['P@5']:<10.4f} | {metrics['P@10']:<10.4f} | {metrics['P@20']:<10.4f}")
+    # Get predictions (Top 20 to cover all K metrics)
+    pred_dict = _build_prediction_dict(scored_test, 20)
+    
+    for k in RANK_KS:
+        # filter_bought_items=True means we don't reward recommending items the user 
+        # already bought in the 'history' window.
+        p, _ = precision_at_k(pred_dict, test_ground_truth, hist_dict, filter_bought_items=True, K=k)
+        print(f"  Precision@{k}: {p:.4f}")
 
 if __name__ == "__main__":
     main()
