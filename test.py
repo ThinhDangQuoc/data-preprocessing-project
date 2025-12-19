@@ -11,8 +11,19 @@ import numpy as np
 import polars as pl
 from xgboost import XGBRanker
 from gensim.models import Word2Vec
-
+from preprocess import *
+from utils import *
+from feature import *
 warnings.filterwarnings('ignore')
+import os
+import polars as pl
+
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
+
+# Best: set environment variable before Polars does heavy work
+os.environ["POLARS_MAX_THREADS"] = str(MAX_WORKERS)
+
+
 
 # GLOBAL PERFORMANCE CONFIG
 pl.Config.set_streaming_chunk_size(1000000)
@@ -45,7 +56,7 @@ def train_item2vec_model(
         .group_by("customer_id")
         .agg(pl.col("item_token"))
         .select("item_token")
-        .collect(streaming=True)
+        .collect()
         .to_series()
         .to_list()
     )
@@ -190,18 +201,20 @@ ALL_SCORES = [
 ]
 
 def standardize(df: pl.LazyFrame, active_score_col: str) -> pl.LazyFrame:
-    """Standardize score columns - ensure all scores exist with proper types"""
-    expr_list = [
+    # Always output: customer_id, item_id, then ALL_SCORES in fixed order
+    exprs = [
         pl.col("customer_id"),
         pl.col("item_id"),
-        pl.col(active_score_col).cast(pl.Float32).alias(active_score_col)
     ]
-    
+
     for sc in ALL_SCORES:
-        if sc != active_score_col:
-            expr_list.append(pl.lit(0.0, dtype=pl.Float32).alias(sc))
-    
-    return df.select(expr_list)
+        if sc == active_score_col:
+            exprs.append(pl.col(active_score_col).cast(pl.Float32).alias(sc))
+        else:
+            exprs.append(pl.lit(0.0, dtype=pl.Float32).alias(sc))
+
+    return df.select(exprs)
+
 
 
 @dataclass(frozen=True)
@@ -244,8 +257,8 @@ SPLITS = {
 }
 
 
-# ============================================================================
-# STAGE 1: ENHANCED CANDIDATE GENERATION
+#  ============================================================================
+# SOLUTION 1: REDUCE CANDIDATE EXPLOSION
 # ============================================================================
 
 def generate_candidates(
@@ -254,321 +267,34 @@ def generate_candidates(
     users: pl.LazyFrame,
     hist_start: datetime,
     hist_end: datetime,
-    n_popular: int = 150,  # ✅ Increased from 100
-    n_category_popular: int = 50,  # ✅ Increased from 30
-    n_recent_trending: int = 100,  # ✅ Increased from 50
-    n_collab_per_item: int = 30,  # ✅ Increased from 15
+    max_candidates_per_user: int = 80,  # ← KEY CHANGE
     verbose: bool = True
 ) -> pl.LazyFrame:
-    """Enhanced candidate generation with MORE diverse sources"""
+    """
+    Optimized candidate generation with HARD LIMITS
+    """
     if verbose:
-        print(f"  [Stage 1] Generating candidates (EXPANDED)...")
+        print(f"\n[Stage 1] Generating candidates (Max {max_candidates_per_user}/user)...")
     
-    # Setup & Type Safety
-    schema = transactions.collect_schema()
-    cid_type = schema["customer_id"]
-    iid_type = schema["item_id"]
+    # Setup (same as before)
+    try:
+        schema = transactions.collect_schema()
+    except (AttributeError, NotImplementedError):
+        sample = transactions.head(1).collect()
+        schema = sample.schema
     
-    target_users = users.select(pl.col("customer_id").cast(cid_type)).unique()
-    items_cast = items.with_columns(pl.col("item_id").cast(iid_type))
+    cid_type = schema.get("customer_id", pl.Utf8)
+    iid_type = schema.get("item_id", pl.Utf8)
     
-    # Filter History
-    hist = transactions.filter(
-        (pl.col("created_date") >= hist_start) & 
-        (pl.col("created_date") <= hist_end)
-    ).with_columns([
-        pl.col("item_id").cast(iid_type),
-        pl.col("customer_id").cast(cid_type)
-    ])
-    
-    hist_with_meta = hist.join(items_cast, on="item_id", how="left")
-    
-    # Strategy 1: Global Popularity (normalized better)
-    popular_items = (
-        hist
-        .group_by("item_id")
-        .len()
-        .sort("len", descending=True)
-        .head(n_popular)
-        .with_columns([
-            (pl.col("len").log() / pl.col("len").log().max()).cast(pl.Float32).alias("feat_pop_score")
-        ])
-        .select(["item_id", "feat_pop_score"])
-    )
-    cands_global = target_users.join(popular_items, how="cross")
-    
-    # Strategy 2: Category Popularity (more categories)
-    user_cats = (
-        hist_with_meta
-        .filter(pl.col("category_id").is_not_null())
-        .group_by(["customer_id", "category_id"])
-        .len()
-        .sort("len", descending=True)
-        .group_by("customer_id", maintain_order=True)
-        .head(5)  # ✅ Increased from 3
-    )
-    
-    cat_pop = (
-        hist_with_meta
-        .filter(pl.col("category_id").is_not_null())
-        .group_by(["category_id", "item_id"])
-        .len()
-        .with_columns(
-            pl.col("len").rank("dense", descending=True).over("category_id").alias("rank")
-        )
-        .filter(pl.col("rank") <= n_category_popular)
-    )
-    
-    cands_category = (
-        user_cats
-        .join(cat_pop, on="category_id")
-        .select([
-            "customer_id",
-            "item_id",
-            (1.0 / pl.col("rank")).cast(pl.Float32).alias("feat_cat_rank_score")
-        ])
-    )
-    
-    # Strategy 3: Collaborative Filtering (Enhanced)
-    user_items = hist.select(["customer_id", "item_id"]).unique()
-    
-    item_pairs = (
-        user_items
-        .join(user_items, on="customer_id", suffix="_right")
-        .filter(pl.col("item_id") != pl.col("item_id_right"))
-        .group_by(["item_id", "item_id_right"])
-        .len()
-        .filter(pl.col("len") > 1)
-        .with_columns([
-            pl.col("len").rank("dense", descending=True).over("item_id").alias("rank"),
-            pl.col("len").log().cast(pl.Float32).alias("cooccur_score")
-        ])
-        .filter(pl.col("rank") <= n_collab_per_item)
-        .select([
-            pl.col("item_id").alias("source_item"),
-            pl.col("item_id_right").alias("target_item"),
-            pl.col("cooccur_score").alias("feat_cf_score")
-        ])
-    )
-    
-    cands_collab = (
-        user_items
-        .join(item_pairs, left_on="item_id", right_on="source_item")
-        .group_by(["customer_id", "target_item"])
-        .agg(pl.col("feat_cf_score").max())
-        .select([
-            "customer_id",
-            pl.col("target_item").alias("item_id"),
-            "feat_cf_score"
-        ])
-    )
-    
-    # Strategy 4: Trending Items (multiple time windows)
-    recent_7d = hist_end - timedelta(days=7)
-    recent_14d = hist_end - timedelta(days=14)
-    
-    trending_7d = (
-        hist
-        .filter(pl.col("created_date") >= recent_7d)
-        .group_by("item_id")
-        .len()
-        .with_columns(pl.lit("7d").alias("window"))
-    )
-    
-    trending_14d = (
-        hist
-        .filter(pl.col("created_date") >= recent_14d)
-        .group_by("item_id")
-        .len()
-        .with_columns(pl.lit("14d").alias("window"))
-    )
-    
-    trending_items = (
-        pl.concat([trending_7d, trending_14d])
-        .group_by("item_id")
-        .agg(pl.col("len").max())
-        .sort("len", descending=True)
-        .head(n_recent_trending)
-        .with_columns(
-            (pl.col("len").log() / pl.col("len").log().max()).cast(pl.Float32).alias("feat_trend_score")
-        )
-        .select(["item_id", "feat_trend_score"])
-    )
-    cands_trending = target_users.join(trending_items, how="cross")
-    
-    # Strategy 5: Price Match
-    item_prices = hist.group_by("item_id").agg(pl.col("price").mean())
-    
-    price_quantiles = item_prices.select([
-        pl.col("price").quantile(0.33).alias("low"),
-        pl.col("price").quantile(0.66).alias("high")
-    ]).collect()
-    
-    low_th = price_quantiles["low"][0]
-    high_th = price_quantiles["high"][0]
-    
-    items_binned = item_prices.with_columns(
-        pl.when(pl.col("price") < low_th).then(pl.lit(1))
-        .when(pl.col("price") < high_th).then(pl.lit(2))
-        .otherwise(pl.lit(3))
-        .alias("price_bin")
-    )
-    
-    users_binned = (
-        hist
-        .group_by("customer_id")
-        .agg(pl.col("price").mean())
-        .with_columns(
-            pl.when(pl.col("price") < low_th).then(pl.lit(1))
-            .when(pl.col("price") < high_th).then(pl.lit(2))
-            .otherwise(pl.lit(3))
-            .alias("price_bin")
-        )
-    )
-    
-    top_items_bin = (
-        hist
-        .join(items_binned, on="item_id")
-        .group_by(["price_bin", "item_id"])
-        .len()
-        .sort("len", descending=True)
-        .group_by("price_bin", maintain_order=True)
-        .head(50)  # ✅ Increased from 30
-    )
-    
-    cands_price = (
-        users_binned
-        .join(top_items_bin, on="price_bin")
-        .select([
-            "customer_id",
-            "item_id",
-            pl.lit(1.0, dtype=pl.Float32).alias("feat_price_match_score")
-        ])
-    )
-    
-    # Strategy 6: Enhanced Item2Vec
-    i2v_model = train_item2vec_model(
-        transactions=transactions,
-        hist_start=hist_start,
-        hist_end=hist_end,
-        verbose=verbose
-    )
-    
-    cands_i2v = generate_i2v_candidates(
-        model=i2v_model,
-        transactions=hist,
-        target_users=target_users,
-        hist_end=hist_end,
-        n_similar=30,
-        top_n_items=5,  # ✅ NEW
-        verbose=verbose
-    )
-    
-    # ✅ NEW Strategy 7: Recent Repeats (users often rebuy)
-    user_recent_repeats = (
-        hist
-        .group_by(["customer_id", "item_id"])
-        .agg(pl.len().alias("repeat_count"))
-        .filter(pl.col("repeat_count") > 1)
-        .with_columns(
-            (pl.col("repeat_count").log() + 1.0).cast(pl.Float32).alias("feat_repeat_score")
-        )
-        .select(["customer_id", "item_id", "feat_repeat_score"])
-    )
-    
-    cands_repeat = standardize(user_recent_repeats, "feat_repeat_score")
-    
-    # Standardize all candidates
-    all_cands = [
-        standardize(cands_global, "feat_pop_score"),
-        standardize(cands_category, "feat_cat_rank_score"),
-        standardize(cands_collab, "feat_cf_score"),
-        standardize(cands_trending, "feat_trend_score"),
-        standardize(cands_price, "feat_price_match_score"),
-        standardize(cands_i2v, "feat_i2v_score"),
-        cands_repeat  # Already standardized
-    ]
-    
-    # Efficient concat and aggregate
-    candidates = (
-        pl.concat(all_cands, how="vertical")
-        .group_by(["customer_id", "item_id"])
-        .agg([pl.col(sc).max() for sc in ALL_SCORES])
-    )
-    
-    if verbose:
-        n_cands = candidates.select(pl.len()).collect().item()
-        n_users = candidates.select(pl.col("customer_id").n_unique()).collect().item()
-        avg_per_user = n_cands / n_users if n_users > 0 else 0
-        print(f"  [Stage 1] Generated {n_cands:,} candidates for {n_users:,} users")
-        print(f"  [Stage 1] Avg candidates/user: {avg_per_user:.1f}")
-    
-    return candidates
-
-
-def check_stage1_recall(
-    candidates_lf: pl.LazyFrame,
-    transactions_lf: pl.LazyFrame,
-    target_start: datetime,
-    target_end: datetime,
-    verbose: bool = True
-) -> float:
-    """Calculates Stage 1 recall - returns recall value"""
-    if not verbose:
-        return 0.0
-    
-    print(f"  [Recall Check] Calculating Stage 1 Recall...")
-    
-    ground_truth = (
-        transactions_lf
-        .filter(
-            (pl.col("created_date") >= target_start) & 
-            (pl.col("created_date") <= target_end)
-        )
-        .select(["customer_id", "item_id"])
+    target_users = (
+        users.select(pl.col("customer_id"))
         .unique()
+        .with_columns(pl.col("customer_id").cast(cid_type))
     )
-    
-    hits = candidates_lf.join(ground_truth, on=["customer_id", "item_id"], how="inner")
-    
-    n_hit_users = hits.select("customer_id").unique().collect().height
-    n_total_target_users = ground_truth.select("customer_id").unique().collect().height
-    
-    recall = n_hit_users / n_total_target_users if n_total_target_users > 0 else 0.0
-    
-    print(f"  [Recall Check] GT Users: {n_total_target_users:,}")
-    print(f"  [Recall Check] Hit Users: {n_hit_users:,}")
-    print(f"  [Recall Check] Recall: {recall:.2%}")
-    
-    if recall < 0.7:
-        print(f"  [WARNING] Recall below 70%! Consider adding more candidate sources.")
-    
-    return recall
-
-
-# ============================================================================
-# STAGE 2: ENHANCED FEATURE ENGINEERING
-# ============================================================================
-
-def build_features(
-    candidates: pl.LazyFrame,
-    transactions: pl.LazyFrame,
-    items: pl.LazyFrame,
-    hist_start: datetime,
-    hist_end: datetime,
-    verbose: bool = True
-) -> pl.LazyFrame:
-    """Enhanced feature engineering with better normalization"""
-    if verbose:
-        print(f"  [Stage 2] Building features (Enhanced)...")
-    
-    cand_schema = candidates.collect_schema()
-    iid_type = cand_schema["item_id"]
-    cid_type = cand_schema["customer_id"]
     
     items_cast = items.with_columns(pl.col("item_id").cast(iid_type))
     
-    hist_trans = (
+    hist = (
         transactions
         .filter(
             (pl.col("created_date") >= hist_start) & 
@@ -580,404 +306,637 @@ def build_features(
         ])
     )
     
-    hist_with_meta = hist_trans.join(items_cast, on="item_id", how="left")
+    hist_with_meta = hist.join(items_cast, on="item_id", how="left")
     
-    # User Statistics (with recency weights)
-    recent_date = hist_end - timedelta(days=14)
-    
-    user_stats = (
-        hist_trans
-        .group_by("customer_id")
-        .agg([
-            pl.len().alias("user_txn_count").cast(pl.Int64),
-            pl.col("item_id").n_unique().alias("user_unique_items").cast(pl.Int64),
-            pl.col("price").mean().alias("user_avg_price").cast(pl.Float32),
-            pl.col("price").std().alias("user_price_std").cast(pl.Float32),
-            pl.col("created_date").max().alias("user_last_purchase_date"),
-        ])
-        .with_columns([
-            pl.col("user_price_std").fill_null(0.0),
-            (pl.lit(hist_end) - pl.col("user_last_purchase_date")).dt.total_days()
-                .cast(pl.Float32).alias("days_since_last_purchase")
-        ])
-    )
-    
-    # Recent activity indicator
-    user_recent_activity = (
-        hist_trans
-        .filter(pl.col("created_date") >= recent_date)
-        .group_by("customer_id")
-        .agg(pl.len().alias("recent_txn_count").cast(pl.Int64))
-    )
-    
-    # Item Statistics
-    item_stats = (
-        hist_trans
+    # ========================================================================
+    # FIX 1: MUCH SMALLER GLOBAL POPULAR SET
+    # ========================================================================
+    popular_items = (
+        hist
         .group_by("item_id")
-        .agg([
-            pl.len().alias("item_txn_count").cast(pl.Int64),
-            pl.col("customer_id").n_unique().alias("item_unique_users").cast(pl.Int64),
-            pl.col("price").mean().alias("item_avg_price").cast(pl.Float32),
-            pl.col("created_date").max().alias("item_last_sale_date"),
+        .len()
+        .sort("len", descending=True)
+        .head(50)  # ← Changed from 150
+        .with_columns([
+            (pl.col("len").log1p() / pl.col("len").log1p().max())
+            .fill_null(0.0)
+            .cast(pl.Float32)
+            .alias("feat_pop_score")
         ])
-        .with_columns(
-            (pl.lit(hist_end) - pl.col("item_last_sale_date")).dt.total_days()
-                .cast(pl.Float32).alias("days_since_last_sale")
-        )
+        .select(["item_id", "feat_pop_score"])
     )
     
-    # Category Affinity
-    user_category_counts = (
+    cands_global = target_users.join(popular_items, how="cross")
+    
+    # ========================================================================
+    # FIX 2: TOP CATEGORIES PER USER (Personalized)
+    # ========================================================================
+    user_top_cats = (
         hist_with_meta
         .filter(pl.col("category_id").is_not_null())
         .group_by(["customer_id", "category_id"])
-        .agg(pl.len().alias("len").cast(pl.Int64))
-        .with_columns(
-            pl.col("len").rank("dense", descending=True).over("customer_id").cast(pl.Int64).alias("category_rank")
-        )
+        .len()
+        .sort("len", descending=True)
+        .group_by("customer_id", maintain_order=True)
+        .head(3)  # ← Only top 3 categories per user
+        .select(["customer_id", "category_id"])
     )
     
-    item_categories = items_cast.select(["item_id", "category_id"]).unique()
+    cat_pop = (
+        hist_with_meta
+        .filter(pl.col("category_id").is_not_null())
+        .group_by(["category_id", "item_id"])
+        .len()
+        .with_columns(
+            pl.col("len")
+            .rank("dense", descending=True)
+            .over("category_id")
+            .alias("rank")
+        )
+        .filter(pl.col("rank") <= 20)  # ← Changed from 50
+    )
     
-    category_affinity = (
-        candidates
-        .join(item_categories, on="item_id", how="left")
-        .join(user_category_counts, on=["customer_id", "category_id"], how="left")
+    cands_category = (
+        user_top_cats
+        .join(cat_pop, on="category_id", how="inner")
         .select([
             "customer_id",
             "item_id",
-            pl.col("len").fill_null(0).cast(pl.Int64).alias("user_category_purchases"),
-            pl.col("category_rank").fill_null(999).cast(pl.Int64).alias("category_rank_for_user")
+            (1.0 / pl.col("rank")).cast(pl.Float32).alias("feat_cat_rank_score")
         ])
     )
     
-    # Niche Score (popularity sweet spot)
-    item_niche_score = (
-        item_stats
-        .with_columns([
-            (1.0 / (1.0 + (pl.col("item_txn_count").cast(pl.Float32).log() - np.log(50)).abs()))
-            .cast(pl.Float32)
-            .alias("niche_score")
-        ])
-        .select(["item_id", "niche_score"])
+    # ========================================================================
+    # FIX 3: USER-SPECIFIC COLLABORATIVE (Not cross-product)
+    # ========================================================================
+    user_recent_items = (
+        hist
+        .sort(["customer_id", "created_date"], descending=[False, True])
+        .group_by("customer_id", maintain_order=True)
+        .agg(pl.col("item_id").head(5))  # ← Only last 5 items per user
+        .explode("item_id")
     )
     
-    # Discovery Features
-    user_known_cats = (
-        hist_with_meta
-        .filter(pl.col("category_id").is_not_null())
-        .select(["customer_id", "category_id"])
+    # Co-occurrence matrix (smaller now)
+    item_pairs = (
+        hist
+        .select(["customer_id", "item_id"])
         .unique()
-        .with_columns(pl.lit(1, dtype=pl.Int8).alias("cat_previously_bought"))
-    )
-    
-    item_birth_date = (
-        hist_trans
-        .group_by("item_id")
-        .agg(pl.col("created_date").min().alias("first_sale_date"))
-    )
-    
-    # ✅ NEW: User-Item interaction history
-    user_item_history = (
-        hist_trans
-        .group_by(["customer_id", "item_id"])
-        .agg([
-            pl.len().alias("historical_purchases").cast(pl.Int64),
-            pl.col("created_date").max().alias("last_purchase_date")
-        ])
-        .with_columns(
-            (pl.lit(hist_end) - pl.col("last_purchase_date")).dt.total_days()
-                .cast(pl.Float32).alias("days_since_user_bought_item")
+        .join(
+            hist.select(["customer_id", "item_id"]).unique(), 
+            on="customer_id", 
+            suffix="_right"
         )
-    )
-    
-    # Merge & Compute
-    features = (
-        candidates
-        .join(user_stats, on="customer_id", how="left")
-        .join(user_recent_activity, on="customer_id", how="left")
-        .join(item_stats, on="item_id", how="left")
-        .join(category_affinity, on=["customer_id", "item_id"], how="left")
-        .join(item_niche_score, on="item_id", how="left")
-        .join(items_cast.select(["item_id", "category_id", "price"]), on="item_id", how="left")
-        .join(user_known_cats, on=["customer_id", "category_id"], how="left")
-        .join(item_birth_date, on="item_id", how="left")
-        .join(user_item_history, on=["customer_id", "item_id"], how="left")
+        .filter(pl.col("item_id") != pl.col("item_id_right"))
+        .group_by(["item_id", "item_id_right"])
+        .len()
+        .filter(pl.col("len") >= 3)  # ← Stronger signal (min 3 co-occurrences)
         .with_columns([
-            # Fill nulls for scores
-            pl.col("feat_pop_score").fill_null(0.0).cast(pl.Float32),
-            pl.col("feat_cat_rank_score").fill_null(0.0).cast(pl.Float32),
-            pl.col("feat_cf_score").fill_null(0.0).cast(pl.Float32),
-            pl.col("feat_trend_score").fill_null(0.0).cast(pl.Float32),
-            pl.col("feat_price_match_score").fill_null(0.0).cast(pl.Float32),
-            pl.col("feat_i2v_score").fill_null(0.0).cast(pl.Float32),
-            
-            # Fill nulls for stats
-            pl.col("user_txn_count").fill_null(0).cast(pl.Int64),
-            pl.col("user_unique_items").fill_null(0).cast(pl.Int64),
-            pl.col("user_avg_price").fill_null(0.0).cast(pl.Float32),
-            pl.col("user_price_std").fill_null(0.0).cast(pl.Float32),
-            pl.col("item_txn_count").fill_null(0).cast(pl.Int64),
-            pl.col("item_unique_users").fill_null(0).cast(pl.Int64),
-            pl.col("item_avg_price").fill_null(0.0).cast(pl.Float32),
-            pl.col("user_category_purchases").fill_null(0).cast(pl.Int64),
-            pl.col("category_rank_for_user").fill_null(999).cast(pl.Int64),
-            pl.col("niche_score").fill_null(0.0).cast(pl.Float32),
-            
-            # Derived features with explicit types
-            (pl.col("item_avg_price") / (pl.col("user_avg_price") + 1.0))
-                .fill_null(0.0).cast(pl.Float32).alias("price_affinity_ratio"),
-            
-            ((pl.col("item_avg_price") - pl.col("user_avg_price")).abs() / (pl.col("user_price_std") + 1.0))
-                .fill_null(0.0).cast(pl.Float32).alias("price_z_score"),
-            
-            (pl.col("user_category_purchases").cast(pl.Float32) / (pl.col("user_txn_count").cast(pl.Float32) + 1.0))
-                .fill_null(0.0).cast(pl.Float32).alias("category_affinity_score"),
-            
-            (pl.col("category_rank_for_user") <= 3).cast(pl.Float32).alias("is_preferred_category"),
-            
-            # Discovery features with explicit types
-            pl.when(pl.col("cat_previously_bought").is_null())
-                .then(pl.lit(1.0, dtype=pl.Float32))
-                .otherwise(pl.lit(0.0, dtype=pl.Float32))
-                .alias("feat_is_new_category"),
-            
-            (pl.lit(hist_end) - pl.col("first_sale_date")).dt.total_days()
-                .fill_null(365)
-                .cast(pl.Float32)
-                .alias("feat_item_age_days"),
-            
-            ((pl.col("price") - pl.col("user_avg_price")) / (pl.col("user_avg_price") + 1.0))
-                .fill_null(0.0)
-                .cast(pl.Float32)
-                .alias("feat_price_drift")
+            pl.col("len")
+            .rank("dense", descending=True)
+            .over("item_id")
+            .alias("rank"),
+            pl.col("len").log1p().cast(pl.Float32).alias("cooccur_score")
+        ])
+        .filter(pl.col("rank") <= 15)  # ← Changed from 30
+        .select([
+            pl.col("item_id").alias("source_item"),
+            pl.col("item_id_right").alias("target_item"),
+            pl.col("cooccur_score").alias("feat_cf_score")
         ])
     )
     
-    # Define feature columns
-    feature_cols = [
-        # Scores
-        *ALL_SCORES,
-        # User Stats
-        "user_txn_count", "user_unique_items", "user_avg_price", "user_price_std",
-        # Item Stats
-        "item_txn_count", "item_unique_users", "item_avg_price", "niche_score",
-        # Affinity
-        "user_category_purchases", "category_rank_for_user", "price_affinity_ratio",
-        "price_z_score", "category_affinity_score", "is_preferred_category",
-        # Discovery
-        "feat_is_new_category", "feat_item_age_days", "feat_price_drift"
+    cands_collab = (
+        user_recent_items
+        .join(item_pairs, left_on="item_id", right_on="source_item", how="inner")
+        .group_by(["customer_id", "target_item"])
+        .agg(pl.col("feat_cf_score").max())
+        .select([
+            "customer_id",
+            pl.col("target_item").alias("item_id"),
+            "feat_cf_score"
+        ])
+    )
+    
+    # ========================================================================
+    # FIX 4: SKIP TRENDING (Creates too many duplicates with Popular)
+    # ========================================================================
+    
+    # ========================================================================
+    # FIX 5: REMOVE PRICE MATCH (Creates cross-product)
+    # ========================================================================
+    
+    # ========================================================================
+    # FIX 6: Item2Vec with SMALLER neighbors
+    # ========================================================================
+    try:
+        i2v_model = train_item2vec_model(
+            transactions=transactions,
+            hist_start=hist_start,
+            hist_end=hist_end,
+            verbose=verbose
+        )
+        
+        cands_i2v = generate_i2v_candidates(
+            model=i2v_model,
+            transactions=hist,
+            target_users=target_users,
+            hist_end=hist_end,
+            n_similar=10,  # ← Changed from 30
+            top_n_items=3,  # ← Changed from 5
+            verbose=verbose
+        )
+    except Exception as e:
+        if verbose:
+            print(f"  [WARNING] Item2Vec failed: {e}")
+        cands_i2v = pl.LazyFrame({
+            "customer_id": [], "item_id": [], "feat_i2v_score": []
+        }, schema={
+            "customer_id": cid_type, "item_id": iid_type, 
+            "feat_i2v_score": pl.Float32
+        })
+    
+    # ========================================================================
+    # FIX 7: Repeat Purchase (Good signal, keep it)
+    # ========================================================================
+    user_recent_repeats = (
+        hist
+        .group_by(["customer_id", "item_id"])
+        .agg(pl.len().alias("repeat_count"))
+        .filter(pl.col("repeat_count") >= 2)  # ← At least 2 purchases
+        .with_columns(
+            (pl.col("repeat_count").log1p() + 1.0)
+            .cast(pl.Float32)
+            .alias("feat_repeat_score")
+        )
+        .select(["customer_id", "item_id", "feat_repeat_score"])
+    )
+    
+    cands_repeat = standardize(user_recent_repeats, "feat_repeat_score")
+    
+    # ========================================================================
+    # COMBINE WITH DIVERSITY CONSTRAINT
+    # ========================================================================
+    all_cands = [
+        standardize(cands_global, "feat_pop_score"),
+        standardize(cands_category, "feat_cat_rank_score"),
+        standardize(cands_collab, "feat_cf_score"),
+        standardize(cands_i2v, "feat_i2v_score"),
+        cands_repeat
     ]
     
-    # Select output with explicit Float32 casting
-    output = features.select([
-        pl.col("customer_id"),
-        pl.col("item_id"),
-        *[pl.col(feat).cast(pl.Float32).alias(f"X_{i}") for i, feat in enumerate(feature_cols)]
-    ])
+    candidates = (
+        pl.concat(all_cands, how="vertical")
+        .group_by(["customer_id", "item_id"])
+        .agg([pl.col(sc).max().fill_null(0.0).alias(sc) for sc in ALL_SCORES])
+    )
+    
+    # ========================================================================
+    # FIX 8: HARD LIMIT PER USER (Critical!)
+    # ========================================================================
+    candidates = (
+        candidates
+        .with_columns([
+            # Combined score for ranking
+            (
+                pl.col("feat_pop_score") * 0.1 +
+                pl.col("feat_cat_rank_score") * 0.3 +
+                pl.col("feat_cf_score") * 0.3 +
+                pl.col("feat_i2v_score") * 0.2 +
+                pl.col("feat_repeat_score") * 0.1
+            ).alias("_combined_score")
+        ])
+        .sort(["customer_id", "_combined_score"], descending=[False, True])
+        .group_by("customer_id", maintain_order=True)
+        .head(max_candidates_per_user)  # ← HARD LIMIT
+        .drop("_combined_score")
+    )
     
     if verbose:
-        print(f"  [Stage 2] Features: {len(feature_cols)}")
+        stats = candidates.select([
+            pl.len().alias("total_cands"),
+            pl.col("customer_id").n_unique().alias("n_users")
+        ]).collect()
+        
+        n_cands = stats["total_cands"][0]
+        n_users = stats["n_users"][0]
+        avg_per_user = n_cands / n_users if n_users > 0 else 0
+        
+        print(f"  Generated {n_cands:,} candidates for {n_users:,} users")
+        print(f"  Avg candidates/user: {avg_per_user:.1f}")
+        
+        if avg_per_user > max_candidates_per_user * 1.1:
+            print(f"  ⚠️ WARNING: Exceeded target! Check candidate generation logic.")
     
-    return output
+    return candidates
+
+
+
+def recall_at_k_candidates(candidates_lf: pl.LazyFrame, trans_lf: pl.LazyFrame,
+                           target_start: datetime, target_end: datetime,
+                           K: int = 80, verbose=True) -> float:
+    # GT pairs in target window
+    gt_pairs = (
+        trans_lf
+        .filter((pl.col("created_date") >= target_start) & (pl.col("created_date") <= target_end))
+        .select(["customer_id","item_id"])
+        .unique()
+    )
+
+    # take top-K candidates per user (if not already limited)
+    cand_topk = (
+        candidates_lf
+        .group_by("customer_id", maintain_order=True)
+        .head(K)
+        .select(["customer_id","item_id"])
+    )
+
+    hit_users = cand_topk.join(gt_pairs, on=["customer_id","item_id"], how="inner") \
+                         .select("customer_id").unique()
+
+    n_hit = hit_users.collect().height
+    n_gt_users = gt_pairs.select("customer_id").unique().collect().height
+    recall = n_hit / n_gt_users if n_gt_users else 0.0
+
+    if verbose:
+        print(f"[Recall@{K}] GT users={n_gt_users:,} hit users={n_hit:,} recall={recall:.2%}")
+    return recall
+
+
+# ============================================================================
+# STAGE 2: ENHANCED FEATURE ENGINEERING
+# ============================================================================
+
+# ============================================================================
+# FIXED STAGE 2: FEATURE ENGINEERING
+# ============================================================================
+
+# ============================================================================
+# SOLUTION 2: BETTER FEATURE BALANCING
+# ============================================================================
+
+def build_features_robust(
+    candidates: pl.LazyFrame,
+    transactions: pl.LazyFrame,
+    items: pl.LazyFrame,
+    hist_start: datetime,
+    hist_end: datetime,
+    verbose: bool = True
+) -> pl.LazyFrame:
+    """
+    Feature engineering with better balance and normalization
+    """
+    if verbose:
+        print(f"\n[Stage 2] Building Balanced Features...")
+    
+    days_in_window = max((hist_end - hist_start).days, 1)
+    
+    # 1. Regularized Popularity (Same as before)
+    item_pop = compute_regularized_popularity(
+        transactions, hist_start, hist_end, verbose=verbose
+    )
+    
+    # 2. Diversity Features
+    diversity_feats = compute_diversity_features(
+        transactions, items, candidates, 
+        hist_start, hist_end, verbose=verbose
+    )
+    
+    # 3. Temporal Features
+    temporal_feats = compute_temporal_features(
+        transactions, candidates,
+        hist_start, hist_end, verbose=verbose
+    )
+    
+    # 4. Interaction Quality
+    quality_feats = compute_interaction_quality(
+        transactions, items, candidates,
+        hist_start, hist_end, verbose=verbose
+    )
+    
+    # 5. User Stats
+    user_daily_stats = (
+        transactions
+        .filter(
+            (pl.col("created_date") >= hist_start) & 
+            (pl.col("created_date") <= hist_end)
+        )
+        .group_by("customer_id")
+        .agg([
+            (pl.len() / days_in_window).alias("user_daily_purchase_rate"),
+            pl.col("price").mean().alias("user_avg_spend"),
+            pl.col("item_id").n_unique().alias("user_item_diversity")
+        ])
+        .with_columns([
+            pl.col("user_avg_spend").fill_null(0.0),
+            pl.col("user_item_diversity").fill_null(1)
+        ])
+    )
+    
+    # 6. MERGE
+    features = (
+        candidates
+        .join(item_pop, on="item_id", how="left")
+        .join(diversity_feats, on=["customer_id", "item_id"], how="left")
+        .join(temporal_feats, on=["customer_id", "item_id"], how="left")
+        .join(quality_feats, on=["customer_id", "item_id"], how="left")
+        .join(user_daily_stats, on="customer_id", how="left")
+    )
+    
+    # ========================================================================
+    # FIX: ADD PERCENTILE NORMALIZATION (Prevent feature dominance)
+    # ========================================================================
+     # FILL NULLS AND RETURN RAW VALUES (NO PERCENTILE RANKING)
+    # XGBoost handles scaling itself. Ranks destroy valuable magnitude info.
+    final_cols = [
+        "feat_cf_score", "feat_i2v_score", "feat_repeat_score", "feat_pop_score",
+        "feat_cat_rank_score",
+        "smoothed_popularity", "log_popularity", "monthly_sales_rate",
+        "exploration_score", "novelty_score", "category_entropy",
+        "sales_momentum", "recent_acceleration", "days_since_last_purchase",
+        "price_fit_score", "complementarity_bonus",
+        "user_daily_purchase_rate", "user_avg_spend"
+    ]
+    # Convert to percentiles (0-1 range) to prevent dominance
+    percentile_exprs = [
+        pl.col("customer_id"),
+        pl.col("item_id")
+    ]
+    
+    # Just select and cast to Float32
+    output_cols = [pl.col("customer_id"), pl.col("item_id")]
+    for col in final_cols:
+        output_cols.append(pl.col(col).fill_null(0).cast(pl.Float32).alias(col))
+        
+    return features.select(output_cols)
 
 
 # ============================================================================
 # DATASET BUILDER
 # ============================================================================
 
-def build_dataset(
-    split: DataSplit,
-    trans: pl.LazyFrame,
-    users: pl.LazyFrame,
-    items: pl.LazyFrame,
+# ============================================================================
+# FIXED: DATASET BUILDER
+# ============================================================================
+
+def build_dataset_v2(
+    split_name: str,
+    split_config: dict,
+    trans_clean: pl.LazyFrame,
+    items_clean: pl.LazyFrame,
+    users_clean: pl.LazyFrame,
     is_train: bool = True,
-    sample_users: float = 1.0,
-    verbose: bool = True
+    verbose: bool = True,
+    *,
+    train_fast: bool = True,
+    n_neg_per_user: int = 20,
+    seed: int = 42,
+    do_recall_check: bool = False, recall_k: int = 80,
 ) -> pl.LazyFrame:
-    """Build dataset with history filtering"""
+    """
+    Train (fast): sample (pos + per-user neg) BEFORE heavy feature engineering.
+    Val/Test: keep full feature dataset as before.
+    """
+
     if verbose:
         print(f"\n{'='*60}")
-        print(f"Building {split.name.upper()} dataset")
+        print(f"Building Dataset: {split_name}")
         print(f"{'='*60}")
-        print(split)
-    
-    # Sample users
-    if sample_users < 1.0:
-        users = users.filter(pl.col("customer_id").hash(42) % 100 < int(sample_users * 100))
-    
-    # Generate candidates
+
+    # 1) Generate candidates
     candidates = generate_candidates(
-        trans, items, users,
-        split.hist_start, split.hist_end,
-        n_popular=100,
+        trans_clean, items_clean, users_clean,
+        split_config["hist_start"],
+        split_config["hist_end"],
         verbose=verbose
     )
-    
-    # Check recall
-    # if is_train and split.target_start is not None:
-    #     check_stage1_recall(
-    #         candidates_lf=candidates,
-    #         transactions_lf=trans,
-    #         target_start=split.target_start,
-    #         target_end=split.target_end,
-    #         verbose=verbose
-    #     )
-    
-    # Build features
-    features = build_features(
-        candidates, trans, items,
-        split.hist_start, split.hist_end,
-        verbose=verbose
-    )
-    
-    # Filter history
-    hist_pairs = (
-        trans
-        .filter(
-            (pl.col("created_date") >= split.hist_start) & 
-            (pl.col("created_date") <= split.hist_end)
+# after candidates created (and optionally after anti-join)
+    if do_recall_check and split_config.get("target_start") is not None:
+        recall_at_k_candidates(
+            candidates_lf=candidates,
+            trans_lf=trans_clean,
+            target_start=split_config["target_start"],
+            target_end=split_config["target_end"],
+            K=recall_k,
+            verbose=True
         )
+
+    # 2) Anti-join history early (reduces rows before any expensive joins)
+    hist_pairs = (
+        trans_clean
+        .filter(pl.col("created_date") <= split_config["hist_end"])
         .select(["customer_id", "item_id"])
         .unique()
     )
-    
-    features = features.join(hist_pairs, on=["customer_id", "item_id"], how="anti")
-    
-    if verbose:
-        print(f"  [Filter] Removed historical items")
-    
-    # Add targets
-    if is_train and split.target_start is not None:
+    candidates = candidates.join(hist_pairs, on=["customer_id", "item_id"], how="anti")
+
+    # =========================
+    # TRAIN FAST PATH
+    # =========================
+    if is_train and train_fast:
+        if split_config.get("target_start") is None:
+            raise ValueError("train_fast requires target_start/target_end in split_config")
+
+        # 3) Sample small set of (customer_id, item_id, Y) BEFORE heavy features
+        sampled_pairs = sample_train_pairs_lazy(
+            candidates=candidates,
+            trans_clean=trans_clean,
+            target_start=split_config["target_start"],
+            target_end=split_config["target_end"],
+            n_neg_per_user=n_neg_per_user,
+            seed=seed,
+            verbose=verbose,
+        )
+
+        # 4) Build heavy features only for sampled candidate pairs
+        #    (drop Y so build_features_robust sees normal candidate schema)
+        feats = build_features_robust(
+            candidates=sampled_pairs.drop("Y"),
+            transactions=trans_clean,
+            items=items_clean,
+            hist_start=split_config["hist_start"],
+            hist_end=split_config["hist_end"],
+            verbose=verbose
+        )
+
+        # 5) Attach label back
+        feats = feats.join(
+            sampled_pairs.select(["customer_id", "item_id", "Y"]),
+            on=["customer_id", "item_id"],
+            how="inner"
+        )
+
+        if verbose:
+            pos_count = feats.filter(pl.col("Y") == 1).select(pl.len()).collect().item()
+            total_count = feats.select(pl.len()).collect().item()
+            print(f"  Positive samples: {pos_count:,}")
+            print(f"  Total samples: {total_count:,}")
+            print(f"  Positive rate: {pos_count/total_count:.2%}")
+
+        return feats
+
+    # =========================
+    # ORIGINAL FULL PATH (VAL/TEST)
+    # =========================
+    # 3) Build features for all candidates
+    features = build_features_robust(
+        candidates=candidates,
+        transactions=trans_clean,
+        items=items_clean,
+        hist_start=split_config["hist_start"],
+        hist_end=split_config["hist_end"],
+        verbose=verbose
+    )
+
+    # 4) Add targets for train/val splits (if present)
+    if split_config.get("target_start") is not None:
         targets = (
-            trans
+            trans_clean
             .filter(
-                (pl.col("created_date") >= split.target_start) & 
-                (pl.col("created_date") <= split.target_end)
+                (pl.col("created_date") >= split_config["target_start"]) &
+                (pl.col("created_date") <= split_config["target_end"])
             )
             .select(["customer_id", "item_id"])
             .unique()
             .with_columns(pl.lit(1).cast(pl.UInt8).alias("Y"))
         )
-        
+
         features = (
             features
             .join(targets, on=["customer_id", "item_id"], how="left")
             .with_columns(pl.col("Y").fill_null(0))
         )
-    
+
+        if verbose:
+            pos_count = features.filter(pl.col("Y") == 1).select(pl.len()).collect().item()
+            total_count = features.select(pl.len()).collect().item()
+            print(f"  Positive samples: {pos_count:,}")
+            print(f"  Total samples: {total_count:,}")
+            print(f"  Positive rate: {pos_count/total_count:.2%}")
+
     return features
+
 
 
 # ============================================================================
 # NUMPY PREPARATION
 # ============================================================================
 
-def prepare_for_xgb(
+# ============================================================================
+# FIXED: NUMPY PREPARATION
+# ============================================================================
+
+import polars as pl
+import numpy as np
+def prepare_for_xgb_v2(
     lf: pl.LazyFrame,
     is_train: bool = True,
-    hard_neg_ratio: int = 10,
-    easy_neg_ratio: int = 10,
-    hard_neg_col: str = "X_14",
-    verbose: bool = True
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str], pl.DataFrame]:
-    """Convert to numpy for XGBoost with Hard Negative Mining"""
+    n_neg_per_user: int = 20,
+    verbose: bool = True,
+    *,
+    filter_no_positive_users: bool | None = None,
+    rand_seed: int = 42,
+):
+    """
+    Prepares data for XGBRanker with STRICT group integrity.
+
+    Fixes validation metric inflation by (optionally) removing users with no positives.
+    """
+    if filter_no_positive_users is None:
+        # Default behavior:
+        # - train: already filters to positive users
+        # - val/test: filter out no-positive users to make ndcg meaningful
+        filter_no_positive_users = (not is_train)
+
     if verbose:
-        print(f"  Materializing data (Hard Negative Mode)...")
-    
-    df = lf.collect()  # ✅ Use streaming collection
-    
-    # Sampling logic (Train only)
-    if is_train and "Y" in df.columns:
-        pos = df.filter(pl.col("Y") == 1)
-        neg = df.filter(pl.col("Y") == 0)
-        n_pos = len(pos)
-        
-        if n_pos > 0:
-            # Identify hard vs easy negatives
-            if hard_neg_col in df.columns:
-                hard_pool = neg.filter(pl.col(hard_neg_col) <= 5)
-                easy_pool = neg.filter(pl.col(hard_neg_col) > 5)
-            else:
-                if verbose:
-                    print(f"  [Warn] {hard_neg_col} not found. Using random sampling.")
-                hard_pool = neg
-                easy_pool = pl.DataFrame([])
-            
-            # Sample
-            n_hard_target = n_pos * hard_neg_ratio
-            n_easy_target = n_pos * easy_neg_ratio
-            
-            # Sample hard negatives
-            if len(hard_pool) > 0:
-                n_hard_actual = min(len(hard_pool), n_hard_target)
-                hard_sampled = hard_pool.sample(n=n_hard_actual, seed=42)
-            else:
-                hard_sampled = pl.DataFrame([], schema=neg.schema)
-            
-            # Sample easy negatives
-            if len(easy_pool) > 0:
-                n_easy_actual = min(len(easy_pool), n_easy_target)
-                easy_sampled = easy_pool.sample(n=n_easy_actual, seed=42)
-            else:
-                n_remaining = (n_pos * (hard_neg_ratio + easy_neg_ratio)) - len(hard_sampled)
-                n_actual = min(len(neg), n_remaining)
-                easy_sampled = neg.sample(n=n_actual, seed=42)
-            
-            # Combine
-            df = pl.concat([pos, hard_sampled, easy_sampled], how="vertical")
-            
-            if verbose:
-                print(f"  [Sampling] Pos: {len(pos):,}")
-                print(f"  [Sampling] Hard Neg: {len(hard_sampled):,} (Target: {n_hard_target:,})")
-                print(f"  [Sampling] Easy Neg: {len(easy_sampled):,} (Target: {n_easy_target:,})")
-                print(f"  [Sampling] Total: {len(df):,}")
-            
-            del pos, neg, hard_pool, easy_pool, hard_sampled, easy_sampled
-            gc.collect()
-    
-    # Validation/Test logic
-    elif not is_train and "Y" in df.columns:
-        pos = df.filter(pl.col("Y") == 1)
-        neg = df.filter(pl.col("Y") == 0)
-        
-        target_neg = min(len(neg), len(pos) * 100)
-        neg_sampled = neg.sample(n=target_neg, seed=42, shuffle=True)
-        
-        df = pl.concat([pos, neg_sampled], how="vertical")
-        
+        print(f"\n[XGB Prep] Preparing data (is_train={is_train})...")
+
+    exclude_cols = ["customer_id", "item_id", "Y", "created_date", "item_token"]
+
+    df = lf.collect()
+
+    feature_cols = [
+        c for c in df.columns
+        if c not in exclude_cols
+        and df[c].dtype in [pl.Float32, pl.Float64, pl.Int32, pl.Int64, pl.UInt8]
+    ]
+
+    if verbose:
+        print(f"  Detected {len(feature_cols)} features.")
+
+    # Helper: keep only users that have at least 1 positive label
+    def _keep_pos_users(df_in: pl.DataFrame) -> pl.DataFrame:
+        if "Y" not in df_in.columns:
+            return df_in  # nothing we can do
+        pos_users = (
+            df_in.filter(pl.col("Y") == 1)
+                 .select("customer_id")
+                 .unique()
+        )
+        return df_in.join(pos_users, on="customer_id", how="inner")
+
+    if is_train:
+        # Train: require positives
+        df_valid = _keep_pos_users(df)
+
+        pos_df = df_valid.filter(pl.col("Y") == 1)
+        neg_df = df_valid.filter(pl.col("Y") == 0)
+
         if verbose:
-            print(f"  [Val-Sample] Reduced to {len(df):,} rows")
-        
-        del pos, neg, neg_sampled
-        gc.collect()
-    
-    # Sort by customer_id for ranking
-    df = df.sort("customer_id")
-    
-    # Extract features
-    feature_cols = [c for c in df.columns if c.startswith("X_")]
-    
-    if not feature_cols:
-        raise ValueError("No columns starting with 'X_' found!")
-    
-    # ✅ More efficient numpy conversion
-    X = df.select(feature_cols).to_numpy()
-    y = df["Y"].to_numpy() if "Y" in df.columns else None
-    
-    # Calculate groups efficiently using pandas-style groupby
-    # This is more stable than RLE for complex operations
-    customer_ids = df["customer_id"].to_numpy()
-    _, groups = np.unique(customer_ids, return_counts=True)
-    
-    id_df = df.select(["customer_id", "item_id"])
-    
+            print(f"  Training: {pos_df.height:,} Positives, {neg_df.height:,} Negatives available.")
+
+        # Safer per-row random in Polars
+        neg_sampled = (
+        neg_df
+        .with_columns(
+            pl.arange(0, pl.len())
+              .shuffle(seed=rand_seed)
+              .alias("__rnd")
+        )
+        .sort("__rnd")
+        .group_by("customer_id", maintain_order=True)
+        .head(n_neg_per_user)
+        .drop("__rnd")
+    )
+
+
+        df_final = (
+            pl.concat([pos_df, neg_sampled], how="vertical")
+            .sort(["customer_id", "Y"], descending=[False, True])
+        )
+
+    else:
+        # Validation/Test:
+        # Optional: remove users with no positives -> avoids inflated/meaningless ndcg
+        if filter_no_positive_users:
+            before_users = df.select("customer_id").n_unique()
+            df = _keep_pos_users(df)
+            if verbose:
+                after_users = df.select("customer_id").n_unique()
+                print(f"  Filtered no-positive users: {before_users} -> {after_users} users")
+
+        df_final = df.sort(["customer_id"])
+
+    # Build numpy arrays
+    X = df_final.select(feature_cols).to_numpy()
+
+    y = df_final["Y"].to_numpy() if "Y" in df_final.columns else None
+
+    query_ids = df_final["customer_id"].to_numpy()
+    _, groups = np.unique(query_ids, return_counts=True)
+
     if verbose:
-        print(f"  Shape: X={X.shape}, groups_count={len(groups)}")
-        if y is not None:
-            print(f"  Avg Group Size: {len(X)/len(groups):.1f}")
-    
-    return X, y, groups, feature_cols, id_df
+        n_samples = df_final.height
+        n_groups = len(groups)
+        avg_group = n_samples / n_groups if n_groups else 0
+        print(f"  Final Output: {n_samples:,} rows")
+        print(f"  Groups (Users): {n_groups:,}")
+        print(f"  Avg Items/Group: {avg_group:.2f}")
+        if (not is_train) and filter_no_positive_users and n_groups == 0:
+            print("  ⚠️ WARNING: Validation has 0 positive users after filtering. Check your target window / anti-join.")
+
+    return X, y, groups, feature_cols, df_final.select(["customer_id", "item_id"])
+
 
 
 # ============================================================================
@@ -985,40 +944,34 @@ def prepare_for_xgb(
 # ============================================================================
 
 def train_model(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    groups_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
-    groups_val: np.ndarray,
+    X_train, y_train, groups_train,
+    X_val, y_val, groups_val,
     verbose: bool = True
 ) -> XGBRanker:
-    """Train XGBoost ranker"""
-    if verbose:
-        print("\n" + "="*60)
-        print("Training XGBRanker")
-        print("="*60)
+    
+    print("\nTraining XGBRanker (Pairwise)...")
     
     model = XGBRanker(
-        objective='rank:ndcg',
-        n_estimators=20,
-        max_depth=6,
+        objective='rank:pairwise', # <--- Changed from rank:ndcg
+        n_estimators=1000,          # Need more trees for pairwise
         learning_rate=0.05,
-        tree_method='hist',
-        n_jobs=-1,
-        random_state=42,
+        max_depth=6,
         subsample=0.8,
         colsample_bytree=0.8,
-        reg_alpha=0.1,
         reg_lambda=1.0,
+        min_child_weight=10,       # Prevent overfitting tiny groups
+        n_jobs=-1,
+        random_state=42,
+        tree_method='hist',
+        
     )
     
     model.fit(
         X_train, y_train,
         group=groups_train,
-        eval_set=[(X_val, y_val)],
-        eval_group=[groups_val],
-        verbose=verbose
+        eval_set=[(X_train, y_train), (X_val, y_val)], # Track train too
+        eval_group=[groups_train, groups_val],
+        verbose=10,
     )
     
     return model
@@ -1066,7 +1019,7 @@ def predict_top_k(
         lf
         .filter(pl.col("customer_id").is_in(gt_users))
         .select(["customer_id", "item_id"] + features)
-        .collect(streaming=True)
+        .collect()
     )
     
     total_rows = len(df_test)
@@ -1188,6 +1141,82 @@ def build_history_dict(
     
     return hist_dict
 
+import numpy as np
+
+def precision_at_k_customer(
+    pred,
+    gt,
+    hist,
+    filter_bought_items: bool = True,
+    K: int = 10,
+    *,
+    return_stats: bool = True,
+):
+    """
+    Customer-compatible Precision@K:
+      - Skip user if (user not in hist) OR (user not in pred)
+      - GT format expected: gt[user]['list_items']
+      - Optionally filters already bought items using hist[user]
+
+    Returns:
+      - mean_precision
+      - cold_start_users
+      - stats (optional)
+    """
+    precisions = []
+    cold_start_users = []
+    nusers = len(gt.keys())
+
+    # optional counters
+    n_missing_hist = 0
+    n_missing_pred = 0
+    n_empty_relevant_after_filter = 0
+
+    for user in gt.keys():
+        missing_hist = (user not in hist)
+        missing_pred = (user not in pred)
+
+        if missing_hist or missing_pred:
+            cold_start_users.append(user)
+            if missing_hist:
+                n_missing_hist += 1
+            if missing_pred:
+                n_missing_pred += 1
+            continue
+
+        val = gt[user]
+        gt_items = val["list_items"] if isinstance(val, dict) else val
+        relevant_items = set(gt_items)
+
+        if filter_bought_items:
+            relevant_items -= set(hist[user])
+
+        if not relevant_items:
+            n_empty_relevant_after_filter += 1
+
+        hits = len(set(pred[user][:K]) & relevant_items)
+        precisions.append(hits / K)
+
+    mean_precision = float(np.mean(precisions)) if precisions else 0.0
+
+    if not return_stats:
+        return mean_precision, cold_start_users
+
+    evaluated = len(precisions)
+    stats = {
+        "total_gt_users": nusers,
+        "evaluated_users": evaluated,
+        "cold_start_users": len(cold_start_users),
+        "missing_hist": n_missing_hist,
+        "missing_pred": n_missing_pred,
+        "coverage_rate": (evaluated / nusers) if nusers else 0.0,
+        "empty_relevant_after_filter": n_empty_relevant_after_filter,
+        "precision_at_k": mean_precision,
+        "K": K,
+        "filter_bought_items": filter_bought_items,
+    }
+
+    return mean_precision, cold_start_users, stats
 
 def precision_at_k(
     pred: Dict[Any, List[Any]],
@@ -1255,86 +1284,181 @@ def precision_at_k(
 # MAIN PIPELINE
 # ============================================================================
 
+# ============================================================================
+# FIXED: MAIN PIPELINE
+# ============================================================================
+
 def main():
-    print("\n" + "="*60)
-    print("TWO-STAGE RECOMMENDATION PIPELINE")
+    """
+    FIXED: Complete pipeline with all bug fixes
+    """
+    # SETTINGS
+    RECREATE_PREPROCESSED = False
+    PROCESSED_DIR = f"{BASE_DIR}/processed_v1"
+    TRAIN_SAMPLE_RATE = 0.1
+    VAL_SAMPLE_RATE = 0.1
+    TEST_SAMPLE_RATE = 1.0  # Always 1.0 for test
+    
+    print("="*60)
+    print("RECOMMENDATION SYSTEM PIPELINE")
     print("="*60)
     
-    # Load ground truth
-    print("\nLoading ground truth...")
+    # ========================================================================
+    # 1. Load Ground Truth
+    # ========================================================================
+    print("\n[1/8] Loading Ground Truth...")
     with open(GT_PKL_PATH, 'rb') as f:
         gt = pickle.load(f)
-    
     gt_user_ids = list(gt.keys())
-    print(f"  Found {len(gt_user_ids):,} users in ground truth")
+    print(f"  GT Users: {len(gt_user_ids):,}")
     
-    # Load data
-    print("\nLoading data sources...")
-    trans = pl.scan_parquet(TRANSACTIONS_GLOB)
-    items = pl.scan_parquet(ITEMS_PATH)
-    users_all = pl.scan_parquet(USERS_GLOB)
+    # ========================================================================
+    # 2. Initialize Raw Data
+    # ========================================================================
+    print("\n[2/8] Loading Raw Data...")
+    raw_trans = pl.scan_parquet(TRANSACTIONS_GLOB)
+    raw_items = pl.scan_parquet(ITEMS_PATH)
+    raw_users = pl.scan_parquet(USERS_GLOB)
+    print("  ✓ Data loaded (lazy)")
     
-    # Filter GT users
-    schema = trans.collect_schema()
-    cid_type = schema["customer_id"]
+    # ========================================================================
+    # 3. Create Splits (FIXED: Now function exists)
+    # ========================================================================
+    print("\n[3/8] Creating Time Splits...")
+    ROBUST_SPLITS = create_realistic_splits(raw_trans)
     
-    gt_users_lf = pl.LazyFrame({"customer_id": gt_user_ids}).with_columns(
-        pl.col("customer_id").cast(cid_type)
+    for split_name, config in ROBUST_SPLITS.items():
+        print(f"  {split_name}:")
+        print(f"    History: {config['hist_start'].date()} → {config['hist_end'].date()}")
+        if config['target_start']:
+            print(f"    Target:  {config['target_start'].date()} → {config['target_end'].date()}")
+    
+    # ========================================================================
+    # 4. Process TRAIN Split
+    # ========================================================================
+    print("\n[4/8] Processing TRAIN Split...")
+    t_trans, t_items, t_users = get_preprocessed_data(
+        "train", ROBUST_SPLITS['train'], 
+        raw_trans, raw_items, raw_users,
+        output_dir=PROCESSED_DIR, 
+        recreate=RECREATE_PREPROCESSED,
+        sample_rate=TRAIN_SAMPLE_RATE
     )
     
-    SAMPLE_USERS = 0.1
+    train_ds = build_dataset_v2(
+    "train",
+    ROBUST_SPLITS["train"],
+    t_trans, t_items, t_users,
+    is_train=True,
+    verbose=True,
+    n_neg_per_user=20,
+    seed=42,
+    do_recall_check=True,
+    recall_k=80
+)
     
-    # Build datasets
-    print("\n" + "="*60)
-    print("Building datasets...")
-    print("="*60)
-    
-    train_lf = build_dataset(
-        SPLITS['train'], trans, users_all, items,
-        is_train=True, sample_users=SAMPLE_USERS
+    # ========================================================================
+    # 5. Process VAL Split (FIXED: Now gets labels)
+    # ========================================================================
+    print("\n[5/8] Processing VAL Split...")
+    v_trans, v_items, v_users = get_preprocessed_data(
+        "val", ROBUST_SPLITS['val'], 
+        raw_trans, raw_items, raw_users,
+        output_dir=PROCESSED_DIR, 
+        recreate=RECREATE_PREPROCESSED,
+        sample_rate=VAL_SAMPLE_RATE
     )
     
-    val_lf = build_dataset(
-        SPLITS['val'], trans, users_all, items,
-        is_train=True, sample_users=SAMPLE_USERS
+    val_ds = build_dataset_v2(
+    "val",
+    ROBUST_SPLITS["val"],
+    v_trans, v_items, v_users,
+    is_train=False,
+    verbose=True,
+    do_recall_check=True,
+    recall_k=80
+)
+    # ========================================================================
+    # 6. Process TEST Split
+    # ========================================================================
+    print("\n[6/8] Processing TEST Split...")
+    
+    # Filter to GT users only
+    gt_users_only = raw_users.filter(pl.col("customer_id").is_in(gt_user_ids))
+    
+    te_trans, te_items, te_users = get_preprocessed_data(
+        "test", ROBUST_SPLITS['test'], 
+        raw_trans, raw_items, gt_users_only,
+        output_dir=PROCESSED_DIR, 
+        recreate=RECREATE_PREPROCESSED,
+        sample_rate=TEST_SAMPLE_RATE  # Always 1.0
     )
     
-    print(f"\nBuilding TEST dataset (GT users: {len(gt_user_ids):,})")
-    test_lf = build_dataset(
-        SPLITS['test'], trans, gt_users_lf, items,
-        is_train=False, sample_users=1.0
+    test_ds = build_dataset_v2(
+        "test", 
+        ROBUST_SPLITS['test'], 
+        te_trans, te_items, te_users, 
+        is_train=False,
+        verbose=True
     )
     
-    # Prepare for XGBoost
-    X_train, y_train, g_train, feats, _ = prepare_for_xgb(
-        train_lf, is_train=True,
-        hard_neg_ratio=15,
-        easy_neg_ratio=15,
-        hard_neg_col="X_14"
+    # ========================================================================
+    # 7. Train Model
+    # ========================================================================
+    print("\n[7/8] Training Model...")
+    
+    # Prepare training data
+    X_train, y_train, g_train, feats, _ = prepare_for_xgb_v2(
+        train_ds, 
+        is_train=True,
+        verbose=True
     )
     
-    X_val, y_val, g_val, _, _ = prepare_for_xgb(val_lf, is_train=False)
+    # Prepare validation data (FIXED: Now has labels)
+    X_val, y_val, g_val, _, _ = prepare_for_xgb_v2(
+        val_ds, 
+        is_train=False,  # Keep all data, no sampling
+        verbose=True,
+        filter_no_positive_users=True,   # <- important
+
+    )
     
     # Train
-    model = train_model(X_train, y_train, g_train, X_val, y_val, g_val)
+    model = train_model(
+        X_train, y_train, g_train, 
+        X_val, y_val, g_val,
+        verbose=True
+    )
     
     # Clean up training data
-    del X_train, y_train, g_train, X_val, y_val, g_val, train_lf, val_lf
+    del X_train, y_train, g_train, X_val, y_val, g_val, train_ds, val_ds
     gc.collect()
     
-    # Predict
-    preds = predict_top_k(model, test_lf, feats, gt_users=gt_user_ids)
+    # ========================================================================
+    # 8. Predict & Evaluate
+    # ========================================================================
+    print("\n[8/8] Generating Predictions...")
     
-    # Build history
+    preds = predict_top_k(
+        model, 
+        test_ds, 
+        feats, 
+        gt_users=gt_user_ids,
+        top_k=10,
+        verbose=True
+    )
+    
+    # Build history for filtering
     hist_dict = build_history_dict(
-        trans,
-        SPLITS['test'].hist_start,
-        SPLITS['test'].hist_end
+        te_trans,
+        ROBUST_SPLITS['test']['hist_start'],
+        ROBUST_SPLITS['test']['hist_end'],
+        verbose=True
     )
     
     # Evaluate
     print("\n" + "="*60)
-    print("Evaluation")
+    print("EVALUATION")
     print("="*60)
     
     p_at_10, missing_users, stats = precision_at_k(
@@ -1342,12 +1466,38 @@ def main():
         gt=gt,
         hist=hist_dict,
         filter_bought_items=True,
-        K=10
+        K=10,
+        verbose=True
     )
+    p_at_10, cold_start_users, stats = precision_at_k_customer(
+        pred=preds,
+        gt=gt,
+        hist=hist_dict,
+        filter_bought_items=True,
+        K=10,
+        return_stats=True
+    )
+
+    print("\n  Evaluation Statistics (Customer Metric):")
+    print(f"  ├─ Total GT users: {stats['total_gt_users']:,}")
+    print(f"  ├─ Evaluated: {stats['evaluated_users']:,}")
+    print(f"  ├─ Cold-start skipped: {stats['cold_start_users']:,}")
+    print(f"  │   ├─ Missing hist: {stats['missing_hist']:,}")
+    print(f"  │   └─ Missing pred: {stats['missing_pred']:,}")
+    print(f"  ├─ Coverage rate: {stats['coverage_rate']:.2%}")
+    print(f"  ├─ Empty relevant after filter: {stats['empty_relevant_after_filter']:,}")
+    print(f"  └─ Precision@{stats['K']}: {stats['precision_at_k']:.4f}")
+
+    # ========================================================================
+    # 9. Save Results
+    # ========================================================================
+    print("\n" + "="*60)
+    print("SAVING RESULTS")
+    print("="*60)
     
-    # Save results
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
+    # Save evaluation
     eval_results = {
         'precision_at_10': float(p_at_10),
         'statistics': stats,
@@ -1358,24 +1508,26 @@ def main():
     eval_path = f"{OUTPUT_DIR}/evaluation.json"
     with open(eval_path, "w") as f:
         json.dump(eval_results, f, indent=2)
-    
-    print(f"\n✓ Evaluation saved: {eval_path}")
+    print(f"✓ Evaluation saved: {eval_path}")
     
     # Save predictions
     output_path = f"{OUTPUT_DIR}/predictions.json"
     with open(output_path, "w") as f:
         json.dump({str(k): v for k, v in preds.items()}, f, indent=2)
-    
     print(f"✓ Predictions saved: {output_path}")
     print(f"  Total: {len(preds):,} users")
     
     # Feature importance
     print("\n" + "="*60)
-    print("Top 10 Feature Importance")
+    print("TOP 10 FEATURE IMPORTANCE")
     print("="*60)
     
     importance = model.get_booster().get_score(importance_type='gain')
-    sorted_importance = sorted(importance.items(), key=lambda x: x[1], reverse=True)
+    sorted_importance = sorted(
+        importance.items(), 
+        key=lambda x: x[1], 
+        reverse=True
+    )
     
     for feat, score in sorted_importance[:10]:
         feat_idx = int(feat.replace('f', ''))
@@ -1383,8 +1535,9 @@ def main():
         print(f"  {feat_name}: {score:.2f}")
     
     print("\n" + "="*60)
-    print("Pipeline Complete!")
+    print("PIPELINE COMPLETE!")
     print("="*60)
+    print(f"Final Precision@10: {p_at_10:.4f}")
 
 
 if __name__ == "__main__":
