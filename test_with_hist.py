@@ -194,14 +194,14 @@ USERS_GLOB = f"{BASE_DIR}/dataset/sales_pers.user_chunk*.parquet"
 GT_PKL_PATH = f"{BASE_DIR}/groundtruth.pkl"
 OUTPUT_DIR = f"{BASE_DIR}/outputs_improved"
 
-# Line 89
+# Line 89 - UPDATE THIS
 ALL_SCORES = [
     "feat_pop_score",
     "feat_cat_rank_score",
     "feat_cf_score",
-    "feat_trend_score",      # ✅ ADD THIS
+    "feat_trend_score",
     "feat_i2v_score",
-    "feat_repeat_score",
+    "feat_repurchase_score",  # ADDED - was "feat_repeat_score"
 ]
 
 def standardize(df: pl.LazyFrame, active_score_col: str) -> pl.LazyFrame:
@@ -271,16 +271,18 @@ def generate_candidates(
     users: pl.LazyFrame,
     hist_start: datetime,
     hist_end: datetime,
-    max_candidates_per_user: int = 100,  # Increased from 80
+    max_candidates_per_user: int = 100,
+    include_repurchase_candidates: bool = True,  # NEW PARAMETER
     verbose: bool = True
 ) -> pl.LazyFrame:
     """
-    IMPROVED: Higher recall candidate generation
+    MODIFIED: Generate candidates WITH repurchase items as a dedicated strategy
     """
     if verbose:
-        print(f"\n[Candidate Gen V2] Target: {max_candidates_per_user} candidates/user")
+        print(f"\n[Candidate Gen V3 - REPURCHASE] Target: {max_candidates_per_user} candidates/user")
+        print(f"  Repurchase mode: {'ENABLED' if include_repurchase_candidates else 'DISABLED'}")
     
-    # Setup
+    # Setup (same as before)
     try:
         schema = transactions.collect_schema()
     except (AttributeError, NotImplementedError):
@@ -313,14 +315,14 @@ def generate_candidates(
     hist_with_meta = hist.join(items_cast, on="item_id", how="left")
     
     # ========================================================================
-    # 1. POPULAR ITEMS (Baseline - Keep Small)
+    # 1. POPULAR ITEMS (Baseline)
     # ========================================================================
     popular_items = (
         hist
         .group_by("item_id")
         .len()
         .sort("len", descending=True)
-        .head(30)  # Small safety net
+        .head(30)
         .with_columns([
             (pl.col("len").log1p() / pl.col("len").log1p().max())
             .fill_null(0.0)
@@ -333,7 +335,7 @@ def generate_candidates(
     cands_global = target_users.join(popular_items, how="cross")
     
     # ========================================================================
-    # 2. CATEGORY-BASED (User's Favorite Categories)
+    # 2. CATEGORY-BASED
     # ========================================================================
     user_top_cats = (
         hist_with_meta
@@ -342,7 +344,7 @@ def generate_candidates(
         .len()
         .sort("len", descending=True)
         .group_by("customer_id", maintain_order=True)
-        .head(5)  # Top 5 categories
+        .head(5)
         .select(["customer_id", "category_id"])
     )
     
@@ -357,7 +359,7 @@ def generate_candidates(
             .over("category_id")
             .alias("rank")
         )
-        .filter(pl.col("rank") <= 30)  # Top 30 per category
+        .filter(pl.col("rank") <= 30)
     )
     
     cands_category = (
@@ -371,17 +373,16 @@ def generate_candidates(
     )
     
     # ========================================================================
-    # 3. IMPROVED COLLABORATIVE FILTERING
+    # 3. COLLABORATIVE FILTERING
     # ========================================================================
     user_recent_items = (
         hist
         .sort(["customer_id", "created_date"], descending=[False, True])
         .group_by("customer_id", maintain_order=True)
-        .agg(pl.col("item_id").head(10))  # Last 10 items
+        .agg(pl.col("item_id").head(10))
         .explode("item_id")
     )
     
-    # FIX: Lower co-occurrence threshold (was 3, now 2)
     item_pairs = (
         hist
         .select(["customer_id", "item_id"])
@@ -394,7 +395,7 @@ def generate_candidates(
         .filter(pl.col("item_id") != pl.col("item_id_right"))
         .group_by(["item_id", "item_id_right"])
         .len()
-        .filter(pl.col("len") >= 1)  # Lower threshold
+        .filter(pl.col("len") >= 1)
         .with_columns([
             pl.col("len")
             .rank("dense", descending=True)
@@ -402,7 +403,7 @@ def generate_candidates(
             .alias("rank"),
             pl.col("len").log1p().cast(pl.Float32).alias("cooccur_score")
         ])
-        .filter(pl.col("rank") <= 5)  # Top 25 similar items
+        .filter(pl.col("rank") <= 25)
         .select([
             pl.col("item_id").alias("source_item"),
             pl.col("item_id_right").alias("target_item"),
@@ -423,29 +424,83 @@ def generate_candidates(
     )
     
     # ========================================================================
-    # 4. REPEAT PURCHASES (High Precision Signal)
+    # 4. NEW/MODIFIED: REPURCHASE CANDIDATES (High-Value Strategy!)
     # ========================================================================
-    user_repeat_items = (
-        hist
-        .group_by(["customer_id", "item_id"])
-        .agg([
-            pl.len().alias("purchase_count"),
-            pl.col("created_date").max().alias("last_purchase")
+    if include_repurchase_candidates:
+        if verbose:
+            print("  [NEW] Generating Repurchase Candidates...")
+        
+        # Strategy: Items user bought before, ranked by repurchase likelihood
+        user_repurchase_items = (
+            hist
+            .group_by(["customer_id", "item_id"])
+            .agg([
+                pl.len().alias("purchase_count"),
+                pl.col("created_date").max().alias("last_purchase"),
+                pl.col("created_date").min().alias("first_purchase"),
+                pl.col("price").mean().alias("avg_price")
+            ])
+            .with_columns([
+                # Recency: More recent = higher score
+                (hist_end - pl.col("last_purchase")).dt.total_days().alias("days_since_last"),
+                
+                # Purchase frequency
+                (pl.col("purchase_count").log1p() + 1.0).alias("frequency_score"),
+                
+                # Regularity: Time between purchases
+                ((pl.col("last_purchase") - pl.col("first_purchase")).dt.total_days() / 
+                 (pl.col("purchase_count").cast(pl.Float32) + 1.0)).alias("avg_days_between")
+            ])
+            .with_columns([
+                # Repurchase score combines:
+                # 1. Frequency (how often they bought it)
+                # 2. Recency (how recent was last purchase)
+                # 3. Regularity (do they buy it regularly?)
+                (
+                    pl.col("frequency_score") * 2.0 +  # Frequency is important
+                    pl.when(pl.col("days_since_last") < 30)
+                    .then(3.0)  # Very recent = very high score
+                    .when(pl.col("days_since_last") < 60)
+                    .then(2.0)
+                    .when(pl.col("days_since_last") < 90)
+                    .then(1.5)
+                    .otherwise(1.0) +  # Recency boost
+                    pl.when(pl.col("avg_days_between") < 60)
+                    .then(1.5)  # Regular purchases = boost
+                    .otherwise(1.0)
+                )
+                .cast(pl.Float32)
+                .alias("feat_repurchase_score")
+            ])
+            .select([
+                "customer_id",
+                "item_id",
+                "feat_repurchase_score",
+                "purchase_count",
+                "days_since_last"
+            ])
+        )
+        
+        cands_repurchase = user_repurchase_items.select([
+            "customer_id",
+            "item_id",
+            "feat_repurchase_score"
         ])
-        .filter(pl.col("purchase_count") >= 2)
-        .with_columns([
-            # Recency weight: more recent = higher score
-            (
-                (pl.col("purchase_count").log1p() + 1.0) * 
-                pl.when((hist_end - pl.col("last_purchase")).dt.total_days() < 30)
-                .then(1.5)
-                .otherwise(1.0)
-            )
-            .cast(pl.Float32)
-            .alias("feat_repeat_score")
-        ])
-        .select(["customer_id", "item_id", "feat_repeat_score"])
-    )
+        
+        if verbose:
+            stats = cands_repurchase.select([
+                pl.len().alias("total"),
+                pl.col("customer_id").n_unique().alias("users")
+            ]).collect()
+            print(f"    Generated {stats['total'][0]:,} repurchase candidates for {stats['users'][0]:,} users")
+    else:
+        # Create empty repurchase candidates if disabled
+        cands_repurchase = pl.LazyFrame({
+            "customer_id": [], "item_id": [], "feat_repurchase_score": []
+        }, schema={
+            "customer_id": cid_type, "item_id": iid_type, 
+            "feat_repurchase_score": pl.Float32
+        })
     
     # ========================================================================
     # 5. ITEM2VEC (Keep but optimize)
@@ -463,8 +518,8 @@ def generate_candidates(
             transactions=hist,
             target_users=target_users,
             hist_end=hist_end,
-            n_similar=50,  # Increased from 10
-            top_n_items=10,  # Consider more user items
+            n_similar=50,
+            top_n_items=10,
             verbose=verbose
         )
     except Exception as e:
@@ -478,7 +533,7 @@ def generate_candidates(
         })
     
     # ========================================================================
-    # 6. NEW: TRENDING ITEMS (Recent Popularity Spike)
+    # 6. TRENDING ITEMS
     # ========================================================================
     recent_date = hist_end - pl.duration(days=14)
     
@@ -498,11 +553,22 @@ def generate_candidates(
     )
     
     cands_trending = target_users.join(trending_items, how="cross")
-
+    
+    # ========================================================================
+    # UPDATE: Include repurchase score in ALL_SCORES
+    # ========================================================================
+    ALL_SCORES_WITH_REPURCHASE = [
+        "feat_pop_score",
+        "feat_cat_rank_score",
+        "feat_cf_score",
+        "feat_trend_score",
+        "feat_i2v_score",
+        "feat_repurchase_score",  # ADDED
+    ]
     
     def standardize(df: pl.LazyFrame, active_score: str) -> pl.LazyFrame:
         exprs = [pl.col("customer_id"), pl.col("item_id")]
-        for sc in ALL_SCORES:
+        for sc in ALL_SCORES_WITH_REPURCHASE:
             if sc == active_score:
                 exprs.append(pl.col(active_score).cast(pl.Float32).alias(sc))
             else:
@@ -510,7 +576,7 @@ def generate_candidates(
         return df.select(exprs)
     
     # ========================================================================
-    # COMBINE WITH DIVERSITY WEIGHTING
+    # COMBINE WITH ENHANCED REPURCHASE WEIGHTING
     # ========================================================================
     all_cands = [
         standardize(cands_global, "feat_pop_score"),
@@ -518,23 +584,23 @@ def generate_candidates(
         standardize(cands_collab, "feat_cf_score"),
         standardize(cands_trending, "feat_trend_score"),
         standardize(cands_i2v, "feat_i2v_score"),
-        standardize(user_repeat_items, "feat_repeat_score"),
+        standardize(cands_repurchase, "feat_repurchase_score"),  # ADDED
     ]
     
     candidates = (
         pl.concat(all_cands, how="vertical")
         .group_by(["customer_id", "item_id"])
-        .agg([pl.col(sc).max().fill_null(0.0).alias(sc) for sc in ALL_SCORES])
+        .agg([pl.col(sc).max().fill_null(0.0).alias(sc) for sc in ALL_SCORES_WITH_REPURCHASE])
     )
     
     # ========================================================================
-    # SMART RANKING: Prioritize Repeat > CF > Category > Rest
+    # SMART RANKING: Prioritize Repurchase > CF > Category > Rest
     # ========================================================================
     candidates = (
         candidates
         .with_columns([
             (
-                pl.col("feat_repeat_score") * 3.0 +      # Strongest signal
+                pl.col("feat_repurchase_score") * 4.0 +  # HIGHEST: Repurchase intent
                 pl.col("feat_cf_score") * 2.0 +          # Collaborative
                 pl.col("feat_cat_rank_score") * 1.5 +    # Category preference
                 pl.col("feat_i2v_score") * 1.0 +         # Semantic similarity
@@ -616,14 +682,14 @@ def build_features_robust(
     verbose: bool = True
 ) -> pl.LazyFrame:
     """
-    Feature engineering with better balance and normalization
+    MODIFIED: Include comprehensive repurchase features
     """
     if verbose:
-        print(f"\n[Stage 2] Building Balanced Features...")
+        print(f"\n[Stage 2] Building Features with Repurchase Support...")
     
     days_in_window = max((hist_end - hist_start).days, 1)
     
-    # 1. Regularized Popularity (Same as before)
+    # 1. Regularized Popularity
     item_pop = compute_regularized_popularity(
         transactions, hist_start, hist_end, verbose=verbose
     )
@@ -646,18 +712,27 @@ def build_features_robust(
         hist_start, hist_end, verbose=verbose
     )
     
-    # 5. User Stats
+    # 5. Repurchase Features
+    repurchase_feats = compute_repurchase_features(
+        transactions, candidates,
+        hist_start, hist_end, verbose=verbose
+    )
+    
+    # 6. FIXED: User Stats - Filter by candidates first
+    target_users = candidates.select("customer_id").unique()
+    
     user_daily_stats = (
         transactions
         .filter(
             (pl.col("created_date") >= hist_start) & 
             (pl.col("created_date") <= hist_end)
         )
+        .join(target_users, on="customer_id", how="inner")  # ← FIX: Only compute for relevant users
         .group_by("customer_id")
         .agg([
-            (pl.len() / days_in_window).alias("user_daily_purchase_rate"),
-            pl.col("price").mean().alias("user_avg_spend"),
-            pl.col("item_id").n_unique().alias("user_item_diversity")
+            (pl.len() / days_in_window).cast(pl.Float32).alias("user_daily_purchase_rate"),
+            pl.col("price").mean().cast(pl.Float32).alias("user_avg_spend"),
+            pl.col("item_id").n_unique().cast(pl.UInt32).alias("user_item_diversity")
         ])
         .with_columns([
             pl.col("user_avg_spend").fill_null(0.0),
@@ -665,41 +740,44 @@ def build_features_robust(
         ])
     )
     
-    # 6. MERGE
+    # 7. MERGE ALL
     features = (
         candidates
         .join(item_pop, on="item_id", how="left")
         .join(diversity_feats, on=["customer_id", "item_id"], how="left")
         .join(temporal_feats, on=["customer_id", "item_id"], how="left")
         .join(quality_feats, on=["customer_id", "item_id"], how="left")
+        .join(repurchase_feats, on=["customer_id", "item_id"], how="left")
         .join(user_daily_stats, on="customer_id", how="left")
     )
     
-    # ========================================================================
-    # FIX: ADD PERCENTILE NORMALIZATION (Prevent feature dominance)
-    # ========================================================================
-     # FILL NULLS AND RETURN RAW VALUES (NO PERCENTILE RANKING)
-    # XGBoost handles scaling itself. Ranks destroy valuable magnitude info.
+    # 8. Final column selection with proper null handling
     final_cols = [
-        "feat_cf_score", "feat_i2v_score", "feat_repeat_score", "feat_pop_score",
-        "feat_cat_rank_score",
+        # Candidate generation scores
+        "feat_cf_score", "feat_i2v_score", "feat_repurchase_score", "feat_pop_score",
+        "feat_cat_rank_score", "feat_trend_score",
+        # Popularity features
         "smoothed_popularity", "log_popularity", "monthly_sales_rate",
+        # Diversity features
         "exploration_score", "novelty_score", "category_entropy",
-        "sales_momentum", "recent_acceleration", "days_since_last_purchase",
+        # Temporal features
+        "sales_momentum", "recent_acceleration",
+        # Quality features
         "price_fit_score", "complementarity_bonus",
-        "user_daily_purchase_rate", "user_avg_spend"
-    ]
-    # Convert to percentiles (0-1 range) to prevent dominance
-    percentile_exprs = [
-        pl.col("customer_id"),
-        pl.col("item_id")
+        # User stats
+        "user_daily_purchase_rate", "user_avg_spend", "user_item_diversity",
+        # Repurchase features
+        "item_repurchase_rate", "user_repurchase_propensity", 
+        "past_cnt", "days_since",
+        "purchase_regularity_score", "repurchase_composite_score"
     ]
     
-    # Just select and cast to Float32
     output_cols = [pl.col("customer_id"), pl.col("item_id")]
     for col in final_cols:
-        output_cols.append(pl.col(col).fill_null(0).cast(pl.Float32).alias(col))
-        
+        output_cols.append(
+            pl.col(col).fill_null(0.0).cast(pl.Float32).alias(col)
+        )
+    
     return features.select(output_cols)
 
 
@@ -720,49 +798,55 @@ def build_dataset_v2(
     is_train: bool = True,
     verbose: bool = True,
     *,
-    max_train_items_per_user: int = 50,  # ← NEW: Control training size
+    max_train_items_per_user: int = 50,
     seed: int = 42,
     do_recall_check: bool = False,
     recall_k: int = 100,
+    allow_repurchase: bool = True,
 ) -> pl.LazyFrame:
-    """
-    FIXED: Build features FIRST, then sample for training
-    """
     
     if verbose:
-        print(f"\n{'='*60}")
-        print(f"Building Dataset V3 FIXED: {split_name}")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}\nBuilding Dataset V3 FIXED: {split_name}\n{'='*60}")
     
-    # 1. Generate candidates (same as before)
-    candidates = generate_candidates(
+    # 1. Generate Candidates (Lazy)
+    candidates_lazy = generate_candidates(
         trans_clean, items_clean, users_clean,
-        split_config["hist_start"],
-        split_config["hist_end"],
+        split_config["hist_start"], split_config["hist_end"],
         verbose=verbose
     )
     
+    # -----------------------------------------------------------------------
+    # CRITICAL OPTIMIZATION: Break Lineage
+    # We collect candidates here to prevent the complex generation graph 
+    # from being duplicated inside every feature function.
+    # -----------------------------------------------------------------------
+    if verbose: print(f"  [Optimization] Materializing candidates to break graph lineage...")
+    
+    # Collect to memory (it's small: users * 100 rows)
+    candidates_df = candidates_lazy.collect()
+    
+    # Convert back to Lazy for feature engineering, but now it's a leaf node!
+    candidates = candidates_df.lazy()
+    
+    if verbose: print(f"  [Optimization] Candidates materialized: {candidates_df.height:,} rows.")
+    # -----------------------------------------------------------------------
+
     # 2. Recall check (optional)
     if do_recall_check and split_config.get("target_start"):
-        recall_at_k_candidates(
-            candidates_lf=candidates,
-            trans_lf=trans_clean,
-            target_start=split_config["target_start"],
-            target_end=split_config["target_end"],
-            K=recall_k,
-            verbose=True
+        recall_at_k_candidates(candidates, trans_clean,
+            split_config["target_start"], split_config["target_end"], K=recall_k, verbose=True)
+    
+    # 3. Filter history if needed
+    if not allow_repurchase:
+        if verbose: print("  [Filtering] Removing previously purchased items...")
+        hist_pairs = (
+            trans_clean
+            .filter(pl.col("created_date") <= split_config["hist_end"])
+            .select(["customer_id", "item_id"]).unique()
         )
+        candidates = candidates.join(hist_pairs, on=["customer_id", "item_id"], how="anti")
     
-    # 3. Anti-join history
-    hist_pairs = (
-        trans_clean
-        .filter(pl.col("created_date") <= split_config["hist_end"])
-        .select(["customer_id", "item_id"])
-        .unique()
-    )
-    candidates = candidates.join(hist_pairs, on=["customer_id", "item_id"], how="anti")
-    
-    # 4. ⭐ BUILD FEATURES FOR ALL CANDIDATES FIRST ⭐
+    # 4. Build features (Now safe because candidates is simple)
     features = build_features_robust(
         candidates=candidates,
         transactions=trans_clean,
@@ -772,14 +856,10 @@ def build_dataset_v2(
         verbose=verbose
     )
     
-    # 5. THEN HANDLE TRAIN/VAL DIFFERENTLY
+    # 5. Train/Val Logic (Same as before)
     if is_train:
-        if split_config.get("target_start") is None:
-            raise ValueError("Train requires target dates")
-        
-        # ⭐ Sample AFTER features with rich ranking context
-        sampled_features = sample_train_pairs_v3_FIXED(
-            candidates_with_features=features,  # ← Has features!
+        return sample_train_pairs_v3_FIXED(
+            candidates_with_features=features,
             trans_clean=trans_clean,
             target_start=split_config["target_start"],
             target_end=split_config["target_end"],
@@ -787,36 +867,16 @@ def build_dataset_v2(
             seed=seed,
             verbose=verbose,
         )
-        
-        return sampled_features
     
-    # 6. VAL/TEST: Add labels to full feature set
+    # Val/Test: Add labels
     if split_config.get("target_start") is not None:
         targets = (
             trans_clean
-            .filter(
-                (pl.col("created_date") >= split_config["target_start"]) &
-                (pl.col("created_date") <= split_config["target_end"])
-            )
-            .select(["customer_id", "item_id"])
-            .unique()
+            .filter(pl.col("created_date").is_between(split_config["target_start"], split_config["target_end"]))
+            .select(["customer_id", "item_id"]).unique()
             .with_columns(pl.lit(1).cast(pl.UInt8).alias("Y"))
         )
-        
-        features = (
-            features
-            .join(targets, on=["customer_id", "item_id"], how="left")
-            .with_columns(pl.col("Y").fill_null(0))
-        )
-        
-        if verbose:
-            stats = features.select([
-                pl.len().alias("total"),
-                pl.col("Y").sum().alias("pos")
-            ]).collect()
-            total = stats["total"][0]
-            pos = stats["pos"][0]
-            print(f"  Positive: {pos:,} / {total:,} ({pos/total:.2%})")
+        features = features.join(targets, on=["customer_id", "item_id"], how="left").with_columns(pl.col("Y").fill_null(0))
     
     return features
 
@@ -1220,27 +1280,18 @@ def precision_at_k_customer(
     pred,
     gt,
     hist,
-    filter_bought_items: bool = True,
+    filter_bought_items: bool = False,  # CHANGED DEFAULT to False
     K: int = 10,
     *,
     return_stats: bool = True,
 ):
     """
-    Customer-compatible Precision@K:
-      - Skip user if (user not in hist) OR (user not in pred)
-      - GT format expected: gt[user]['list_items']
-      - Optionally filters already bought items using hist[user]
-
-    Returns:
-      - mean_precision
-      - cold_start_users
-      - stats (optional)
+    MODIFIED: Customer-compatible Precision@K with repurchase support
     """
     precisions = []
     cold_start_users = []
     nusers = len(gt.keys())
 
-    # optional counters
     n_missing_hist = 0
     n_missing_pred = 0
     n_empty_relevant_after_filter = 0
@@ -1261,7 +1312,8 @@ def precision_at_k_customer(
         gt_items = val["list_items"] if isinstance(val, dict) else val
         relevant_items = set(gt_items)
 
-        if filter_bought_items:
+        # MODIFIED: Only filter if explicitly requested
+        if filter_bought_items and user in hist:
             relevant_items -= set(hist[user])
 
         if not relevant_items:
@@ -1295,11 +1347,13 @@ def precision_at_k(
     pred: Dict[Any, List[Any]],
     gt: Dict[Any, Any],
     hist: Dict[Any, List[Any]],
-    filter_bought_items: bool = True,
+    filter_bought_items: bool = False,  # CHANGED DEFAULT to False
     K: int = 10,
     verbose: bool = True
 ) -> Tuple[float, List[Any], Dict[str, int]]:
-    """Compute Precision@K"""
+    """
+    MODIFIED: Default to NOT filtering bought items (allow repurchase)
+    """
     precisions = []
     missing_preds_users = []
     
@@ -1316,10 +1370,12 @@ def precision_at_k(
         
         relevant_items = set(gt_items)
         
-        # Filter purchased items
-        if filter_bought_items:
+        # MODIFIED: Only filter if explicitly requested
+        if filter_bought_items and user in hist:
             past_items = set(hist.get(user, []))
             relevant_items -= past_items
+            if verbose and len(relevant_items) == 0:
+                print(f"  Warning: User {user} has no new items after filtering")
         
         if not relevant_items:
             precisions.append(0.0)
@@ -1340,7 +1396,8 @@ def precision_at_k(
         'evaluated_users': n_evaluated,
         'users_without_preds': n_missing,
         'coverage_rate': n_evaluated / nusers if nusers > 0 else 0.0,
-        'mean_precision': mean_precision
+        'mean_precision': mean_precision,
+        'filter_bought_items': filter_bought_items
     }
     
     if verbose:
@@ -1348,9 +1405,11 @@ def precision_at_k(
         print(f"  ├─ Total GT users: {stats['total_gt_users']:,}")
         print(f"  ├─ Evaluated: {stats['evaluated_users']:,}")
         print(f"  ├─ Missing Preds: {stats['users_without_preds']:,}")
+        print(f"  ├─ Filter Bought: {filter_bought_items}")
         print(f"  └─ Precision@{K}: {stats['mean_precision']:.4f}")
     
     return mean_precision, missing_preds_users, stats
+
 def predict_with_cold_start_fallback(
     model: XGBRanker,
     lf: pl.LazyFrame,
@@ -1399,7 +1458,7 @@ def main():
     FIXED: Complete pipeline with all bug fixes
     """
     # SETTINGS
-    RECREATE_PREPROCESSED = False
+    RECREATE_PREPROCESSED = True
     PROCESSED_DIR = f"{BASE_DIR}/processed_v1"
     TRAIN_SAMPLE_RATE = 0.1
     VAL_SAMPLE_RATE = 0.1
@@ -1452,15 +1511,16 @@ def main():
     )
     
     train_ds = build_dataset_v2(
-    "train",
-    ROBUST_SPLITS["train"],
-    t_trans, t_items, t_users,
-    is_train=True,
-    verbose=True,
-    seed=42,
-    do_recall_check=True,
-    recall_k=80
-)
+        "train",
+        ROBUST_SPLITS["train"],
+        t_trans, t_items, t_users,
+        is_train=True,
+        verbose=True,
+        seed=42,
+        do_recall_check=True,
+        recall_k=80,
+        allow_repurchase=True  # NEW: Allow repurchases
+    )
     
     # ========================================================================
     # 5. Process VAL Split (FIXED: Now gets labels)
@@ -1475,14 +1535,15 @@ def main():
     )
     
     val_ds = build_dataset_v2(
-    "val",
-    ROBUST_SPLITS["val"],
-    v_trans, v_items, v_users,
-    is_train=False,
-    verbose=True,
-    do_recall_check=True,
-    recall_k=80
-)
+        "val",
+        ROBUST_SPLITS["val"],
+        v_trans, v_items, v_users,
+        is_train=False,
+        verbose=True,
+        do_recall_check=True,
+        recall_k=80,
+        allow_repurchase=True  # NEW: Allow repurchases
+    )
     val_ds = sample_validation_data(
         val_ds, 
         target_positive_rate=0.10,
@@ -1509,8 +1570,10 @@ def main():
         ROBUST_SPLITS['test'], 
         te_trans, te_items, te_users, 
         is_train=False,
-        verbose=True
+        verbose=True,
+        allow_repurchase=True  # NEW: Allow repurchases
     )
+    
     
     # ========================================================================
     # 7. Train Model
@@ -1539,7 +1602,7 @@ def main():
         X_val, y_val, g_val,
         verbose=True
     )
-    model.save(f"{OUTPUT_DIR}/xgb_model.json")
+    model.save_model(f"{OUTPUT_DIR}/xgb_ranker.json")
     # Clean up training data
     del X_train, y_train, g_train, X_val, y_val, g_val, train_ds, val_ds
     gc.collect()
@@ -1579,15 +1642,16 @@ def main():
         pred=preds,
         gt=gt,
         hist=hist_dict,
-        filter_bought_items=True,
+        filter_bought_items=False,  # CHANGED: Allow repurchases
         K=10,
         verbose=True
     )
-    p_at_10, cold_start_users, stats = precision_at_k_customer(
+    
+    p_at_10_customer, cold_start_users, stats_customer = precision_at_k_customer(
         pred=preds,
         gt=gt,
         hist=hist_dict,
-        filter_bought_items=True,
+        filter_bought_items=False,  # CHANGED: Allow repurchases
         K=10,
         return_stats=True
     )
@@ -1595,7 +1659,6 @@ def main():
     print("\n  Evaluation Statistics (Customer Metric):")
     print(f"  ├─ Total GT users: {stats['total_gt_users']:,}")
     print(f"  ├─ Evaluated: {stats['evaluated_users']:,}")
-    print(f"  ├─ Cold-start skipped: {stats['cold_start_users']:,}")
     print(f"  │   ├─ Missing hist: {stats['missing_hist']:,}")
     print(f"  │   └─ Missing pred: {stats['missing_pred']:,}")
     print(f"  ├─ Coverage rate: {stats['coverage_rate']:.2%}")

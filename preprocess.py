@@ -10,7 +10,58 @@ Key Improvements:
 import polars as pl
 from datetime import datetime, timedelta
 import numpy as np
+import polars as pl
 
+def balanced_activity_sample(
+    users_stratified: pl.LazyFrame,
+    seed: int = 42,
+    verbose: bool = True
+) -> pl.LazyFrame:
+    """
+    Creates a 50/50 dataset of High Activity vs Low Activity users.
+    
+    Strategy:
+    1. Keep ALL 'power' and 'regular' users (High Signal).
+    2. Undersample 'cold_start' and 'casual' users to match the count of High Signal users.
+    
+    Why?
+    - If we sample randomly, 90% of data is cold-start (Noise).
+    - We need the model to learn deep item correlations from the Power users.
+    """
+    
+    # 1. Define Groups
+    # High Signal: The users who actually teach us what items go together
+    high_signal_condition = pl.col("user_tier").is_in(["power", "regular"])
+    
+    # Low Signal: Users who mostly need fallback strategies (Popularity/Trend)
+    low_signal_condition = pl.col("user_tier").is_in(["casual", "cold_start"])
+
+    # 2. Separate the populations
+    df_users = users_stratified.collect() # Materialize for exact counts (it's small enough: user IDs)
+    
+    high_signal_users = df_users.filter(high_signal_condition)
+    low_signal_users = df_users.filter(low_signal_condition)
+    
+    n_high = len(high_signal_users)
+    n_low_available = len(low_signal_users)
+    
+    # 3. Sample Low Signal to match High Signal (1:1 Ratio)
+    # If we have 150k Active users, we pick 150k Inactive users.
+    n_sample = min(n_high, n_low_available)
+    
+    # Sample using Polars sample (shuffle=True)
+    low_signal_sampled = low_signal_users.sample(n=n_sample, seed=seed, shuffle=True)
+    
+    # 4. Combine
+    balanced_df = pl.concat([high_signal_users, low_signal_sampled])
+    
+    if verbose:
+        print(f"\n[Balanced Sampling Strategy]")
+        print(f"  ├─ High Signal (Power/Regular): {n_high:,} (Kept 100%)")
+        print(f"  ├─ Low Signal (Cold/Casual):    {n_sample:,} (Sampled from {n_low_available:,})")
+        print(f"  └─ Total Training Users:        {len(balanced_df):,} (50/50 Split)")
+        
+    return balanced_df.lazy()
 # ============================================================================
 # 1. TEMPORAL VALIDATION FIX
 # ============================================================================
@@ -24,21 +75,23 @@ def create_realistic_splits(transactions: pl.LazyFrame, verbose=True):
     
     SPLITS_ROBUST = {
         'train': {
-            'hist_start': datetime(2024, 10, 1),
-            'hist_end': datetime(2024, 11, 20),    # Leave 10-day gap
-            'target_start': datetime(2024, 12, 1),
-            'target_end': datetime(2024, 12, 10)
+            'hist_start': datetime(2024, 9, 1),   # Sept 1
+            'hist_end': datetime(2024, 10, 1),   # Oct 31 (60 days)
+            'target_start': datetime(2024, 11, 5), # Nov 5 (5-day gap)
+            'target_end': datetime(2024, 11, 14)   # Nov 14 (10 days)
         },
         'val': {
-            'hist_start': datetime(2024, 10, 1),
-            'hist_end': datetime(2024, 11, 30),    # Use same history length
-            'target_start': datetime(2024, 12, 11),
-            'target_end': datetime(2024, 12, 20)
+            'hist_start': datetime(2024, 10, 1),  # Oct 1
+            'hist_end': datetime(2024, 11, 1),   # Nov 30 (60 days)
+            'target_start': datetime(2024, 12, 5), # Dec 5 (5-day gap)
+            'target_end': datetime(2024, 12, 14)   # Dec 14 (10 days)
         },
         'test': {
-            'hist_start': datetime(2024, 12, 1),
-            'hist_end': datetime(2024, 12, 30),
-            'target_start': None,  # Ground truth
+            # This depends on when your ground truth is from
+            # Adjust based on your GT file date range
+            'hist_start': datetime(2024, 11, 1),  # Nov 1
+            'hist_end': datetime(2024, 12, 31),   # Dec 31 (60 days)
+            'target_start': None,  # From ground truth file
             'target_end': None
         }
     }
@@ -237,8 +290,8 @@ def filter_quality_items(
     items: pl.LazyFrame,
     hist_start: datetime,
     hist_end: datetime,
-    min_sales: int = 5,
-    min_users: int = 3,
+    min_sales: int = 0,
+    min_users: int = 0,
     verbose=True
 ) -> pl.LazyFrame:
     """
@@ -339,42 +392,41 @@ def preprocess_pipeline(
     transactions: pl.LazyFrame,
     items: pl.LazyFrame,
     users: pl.LazyFrame,
+    split_name: str,       # 'train', 'val', or 'test'
     split_config: dict,
-    sample_rate: float = 0.1,
     verbose=True
 ):
-    """
-    Full preprocessing pipeline
-    """
     hist_start = split_config['hist_start']
     hist_end = split_config['hist_end']
     
-    # Step 1: Preprocess transactions
+    # 1. Clean Transactions
     trans_clean = preprocess_transactions(
         transactions, items, hist_end, verbose
     )
     
-    # Step 2: Filter quality items
+    # 2. Quality Filter Items
     items_quality = filter_quality_items(
         transactions, items, hist_start, hist_end, verbose=verbose
     )
     
-    # Step 3: Stratify users
+    # 3. Stratify Users
     users_stratified = stratify_users_by_activity(
         transactions, users, hist_start, hist_end, verbose
     )
     
-    # Step 4: Stratified sampling
-    if sample_rate < 1.0:
-        users_sampled = stratified_sample(users_stratified, sample_rate)
-    else:
-        users_sampled = users_stratified
+    # 4. SAMPLING LOGIC (The Fix)
+    if split_name in ['train', 'val']:
+        # For Train/Val: Enforce 50/50 balance to learn personalization
+        if verbose: print(f"  Applying Balanced Sampling for {split_name}...")
+        users_final = balanced_activity_sample(users_stratified, seed=42, verbose=verbose)
+        
+    else: 
+        # For Test: Keep EVERYONE (100%) or use standard sampling
+        # In reality, you usually test on 100% of target users
+        if verbose: print(f"  Keeping all users for {split_name} (Evaluation Mode)...")
+        users_final = users_stratified
     
-    if verbose:
-        print(f"\n[Pipeline Complete]")
-        print(f"  Sampled users: {users_sampled.select(pl.len()).collect().item():,}")
-    
-    return trans_clean, items_quality, users_sampled
+    return trans_clean, items_quality, users_final
 
 
 # ============================================================================
