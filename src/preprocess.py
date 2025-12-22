@@ -11,7 +11,72 @@ import polars as pl
 from datetime import datetime, timedelta
 import numpy as np
 import polars as pl
-
+def classify_user_intent(
+    transactions: pl.LazyFrame,
+    hist_start: datetime,
+    hist_end: datetime,
+    verbose: bool = True
+) -> pl.LazyFrame:
+    """
+    Classify users into intent profiles:
+    - REPURCHASER: High repurchase rate, low exploration
+    - EXPLORER: High exploration, low repurchase
+    - BALANCED: Mix of both
+    - COLD_START: Insufficient data
+    """
+    
+    user_behavior = (
+        transactions
+        .filter(pl.col("created_date").is_between(hist_start, hist_end))
+        .group_by("customer_id")
+        .agg([
+            pl.len().alias("total_txns"),
+            pl.col("item_id").n_unique().alias("unique_items"),
+            pl.col("item_id").len().alias("total_items")
+        ])
+        .with_columns([
+            # Repurchase rate: How often they buy same items
+            (1.0 - pl.col("unique_items") / pl.col("total_items"))
+            .clip(0, 1)
+            .alias("repurchase_rate"),
+            
+            # Exploration score: Variety relative to purchase volume
+            (pl.col("unique_items").log1p() / pl.col("total_txns").log1p())
+            .clip(0, 1)
+            .alias("exploration_score")
+        ])
+        .with_columns([
+            # Classify user intent
+            pl.when(pl.col("total_txns") < 5)
+            .then(pl.lit("COLD_START"))
+            .when(
+                (pl.col("repurchase_rate") > 0.4) & 
+                (pl.col("exploration_score") < 0.6)
+            )
+            .then(pl.lit("REPURCHASER"))
+            .when(
+                (pl.col("exploration_score") > 0.7) & 
+                (pl.col("repurchase_rate") < 0.3)
+            )
+            .then(pl.lit("EXPLORER"))
+            .otherwise(pl.lit("BALANCED"))
+            .alias("user_intent"),
+            
+            # Intent strength (confidence in classification)
+            pl.max_horizontal(
+                (pl.col("repurchase_rate") - 0.5).abs(),
+                (pl.col("exploration_score") - 0.5).abs()
+            ).alias("intent_strength")
+        ])
+    )
+    
+    if verbose:
+        stats = user_behavior.group_by("user_intent").len().collect()
+        print("\n[User Intent Classification]")
+        for row in stats.iter_rows():
+            print(f"  {row[0]}: {row[1]:,}")
+    
+    return user_behavior
 def balanced_activity_sample(
     users_stratified: pl.LazyFrame,
     seed: int = 42,
@@ -76,13 +141,13 @@ def create_realistic_splits(transactions: pl.LazyFrame, verbose=True):
     SPLITS_ROBUST = {
         'train': {
             'hist_start': datetime(2024, 9, 1),   # Sept 1
-            'hist_end': datetime(2024, 10, 1),   # Oct 31 (60 days)
+            'hist_end': datetime(2024, 10, 31),   # Oct 31 (60 days)
             'target_start': datetime(2024, 11, 5), # Nov 5 (5-day gap)
             'target_end': datetime(2024, 11, 14)   # Nov 14 (10 days)
         },
         'val': {
             'hist_start': datetime(2024, 10, 1),  # Oct 1
-            'hist_end': datetime(2024, 11, 1),   # Nov 30 (60 days)
+            'hist_end': datetime(2024, 11, 30),   # Nov 30 (60 days)
             'target_start': datetime(2024, 12, 5), # Dec 5 (5-day gap)
             'target_end': datetime(2024, 12, 14)   # Dec 14 (10 days)
         },
@@ -290,8 +355,8 @@ def filter_quality_items(
     items: pl.LazyFrame,
     hist_start: datetime,
     hist_end: datetime,
-    min_sales: int = 0,
-    min_users: int = 0,
+    min_sales: int = 5,
+    min_users: int = 3,
     verbose=True
 ) -> pl.LazyFrame:
     """
@@ -327,9 +392,9 @@ def filter_quality_items(
         item_stats
         .filter(
             (pl.col("sales_count") >= min_sales) &
-            (pl.col("unique_buyers") >= min_users) &
-            (pl.col("avg_price") >= p1) &
-            (pl.col("avg_price") <= p99)
+            (pl.col("unique_buyers") >= min_users) 
+            # (pl.col("avg_price") >= p1) &
+            # (pl.col("avg_price") <= p99)
         )
         .select("item_id")
     )

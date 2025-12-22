@@ -3,7 +3,7 @@ import polars as pl
 from pathlib import Path
 from preprocess import preprocess_pipeline
 from datetime import datetime, timedelta
-
+from typing import List, Any, Tuple, Dict
 def get_preprocessed_data(
     split_name: str,
     split_config: dict,
@@ -323,3 +323,100 @@ def optimize_dtypes(df: pl.LazyFrame, verbose: bool = True) -> pl.LazyFrame:
     
     return df
 
+# ============================================================================
+# EVALUATION: Measure Balance
+# ============================================================================
+
+def evaluate_discovery_coverage(
+    predictions: Dict,
+    history: Dict,
+    ground_truth: Dict,
+    verbose: bool = True
+) -> Dict:
+    """
+    Measure how well we balance repurchase vs discovery
+    
+    Metrics:
+    - Repurchase Precision: % of predictions that are repurchases
+    - Discovery Precision: % of predictions that are NEW items
+    - Diversity: Unique items across all users
+    - Serendipity: Correct NEW items predicted
+    """
+    
+    total_recs = 0
+    repurchase_count = 0
+    discovery_count = 0
+    correct_repurchase = 0
+    correct_discovery = 0
+    
+    for user, pred_items in predictions.items():
+        if user not in history or user not in ground_truth:
+            continue
+        
+        hist_items = set(history[user])
+        gt_items = set(ground_truth[user] if isinstance(ground_truth[user], list) 
+                      else ground_truth[user]['list_items'])
+        
+        for item in pred_items:
+            total_recs += 1
+            
+            # Check if repurchase or discovery
+            if item in hist_items:
+                repurchase_count += 1
+                if item in gt_items:
+                    correct_repurchase += 1
+            else:
+                discovery_count += 1
+                if item in gt_items:
+                    correct_discovery += 1
+    
+    metrics = {
+        "repurchase_ratio": repurchase_count / total_recs if total_recs > 0 else 0,
+        "discovery_ratio": discovery_count / total_recs if total_recs > 0 else 0,
+        "repurchase_precision": correct_repurchase / repurchase_count if repurchase_count > 0 else 0,
+        "discovery_precision": correct_discovery / discovery_count if discovery_count > 0 else 0,
+        "total_recommendations": total_recs
+    }
+    
+    if verbose:
+        print("\n" + "="*60)
+        print("DISCOVERY-REPURCHASE BALANCE")
+        print("="*60)
+        print(f"Repurchase: {metrics['repurchase_ratio']:.1%} "
+              f"(Precision: {metrics['repurchase_precision']:.3f})")
+        print(f"Discovery:  {metrics['discovery_ratio']:.1%} "
+              f"(Precision: {metrics['discovery_precision']:.3f})")
+    
+    return metrics
+
+    
+
+def recall_at_k_candidates(candidates_lf: pl.LazyFrame, trans_lf: pl.LazyFrame,
+                           target_start: datetime, target_end: datetime,
+                           K: int = 80, verbose=True) -> float:
+    # GT pairs in target window
+    gt_pairs = (
+        trans_lf
+        .filter((pl.col("created_date") >= target_start) & (pl.col("created_date") <= target_end))
+        .select(["customer_id","item_id"])
+        .unique()
+    )
+
+    # take top-K candidates per user (if not already limited)
+    cand_topk = (
+        candidates_lf
+        .group_by("customer_id", maintain_order=True)
+        .head(K)
+        .select(["customer_id","item_id"])
+    )
+
+    hit_users = cand_topk.join(gt_pairs, on=["customer_id","item_id"], how="inner") \
+                         .select("customer_id").unique()
+
+    n_hit = hit_users.collect().height
+    n_gt_users = gt_pairs.select("customer_id").unique().collect().height
+    recall = n_hit / n_gt_users if n_gt_users else 0.0
+
+    if verbose:
+        print(f"[Recall@{K}] GT users={n_gt_users:,} hit users={n_hit:,} recall={recall:.2%}")
+    return recall

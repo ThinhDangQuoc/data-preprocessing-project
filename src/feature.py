@@ -80,12 +80,117 @@ def compute_regularized_popularity(
         .select(["item_id", "smoothed_popularity", "log_popularity", "monthly_sales_rate", "unique_users"])
     )
 
+# ============================================================================
+# 5. MULTI-OBJECTIVE RANKING
+# ============================================================================
 
+def compute_final_ranking_score(
+    features: pl.LazyFrame,
+    verbose: bool = True
+) -> pl.LazyFrame:
+    """
+    Compute final ranking score with balanced objectives
+    
+    Objectives:
+    1. Accuracy (Repurchase)
+    2. Discovery (Novelty)
+    3. Serendipity (Surprise & Delight)
+    """
+    
+    ranked = features.with_columns([
+        # Multi-objective score
+        (
+            # Core signals (50%)
+            pl.col("feat_repurchase_weighted").fill_null(0.0) * 0.25 +
+            pl.col("feat_cf_score").fill_null(0.0) * 0.15 +
+            pl.col("feat_i2v_score").fill_null(0.0) * 0.10 +
+            
+            # Discovery signals (30%)
+            pl.col("feat_discovery_weighted").fill_null(0.0) * 0.20 +
+            pl.col("feat_discovery_new_item").fill_null(0.0) * 0.05 +
+            pl.col("feat_discovery_trending").fill_null(0.0) * 0.05 +
+            
+            # Serendipity (10%)
+            pl.col("feat_serendipity_bonus").fill_null(0.0) * 0.10 +
+            
+            # Baseline (10%)
+            pl.col("feat_pop_score").fill_null(0.0) * 0.05 +
+            pl.col("feat_cat_rank_score").fill_null(0.0) * 0.05
+        )
+        .alias("final_ranking_score")
+    ])
+    
+    if verbose:
+        # Analyze score distribution by candidate type
+        stats = ranked.group_by("candidate_type").agg([
+            pl.col("final_ranking_score").mean().alias("avg_score"),
+            pl.len().alias("count")
+        ]).collect()
+        
+        print("\n[Ranking Scores by Type]")
+        for row in stats.iter_rows():
+            print(f"  {row[0]}: avg={row[1]:.3f}, count={row[2]:,}")
+    
+    return ranked
 
 # ============================================================================
 # 2. DIVERSITY & EXPLORATION FEATURES
 # ============================================================================
-
+def compute_balanced_features(
+    candidates: pl.LazyFrame,
+    transactions: pl.LazyFrame,
+    items: pl.LazyFrame,
+    user_intent: pl.LazyFrame,
+    hist_start: datetime,
+    hist_end: datetime,
+    verbose: bool = True
+) -> pl.LazyFrame:
+    """
+    Add features that balance repurchase vs discovery
+    """
+    
+    if verbose:
+        print("\n[Feature Engineering] Computing balanced features...")
+    
+    # Join user intent
+    candidates_with_intent = candidates.join(
+        user_intent.select([
+            "customer_id",
+            "user_intent",
+            "repurchase_rate",
+            "exploration_score"
+        ]),
+        on="customer_id",
+        how="left"
+    )
+    
+    # Add intent-aware weights
+    features = candidates_with_intent.with_columns([
+        # Repurchase features (boosted for REPURCHASER)
+        pl.when(pl.col("user_intent") == "REPURCHASER")
+        .then(pl.col("feat_repurchase_score") * 1.5)
+        .otherwise(pl.col("feat_repurchase_score") * 0.8)
+        .alias("feat_repurchase_weighted"),
+        
+        # Discovery features (boosted for EXPLORER)
+        pl.when(pl.col("user_intent") == "EXPLORER")
+        .then(pl.col("discovery_score") * 1.5)
+        .when(pl.col("user_intent") == "COLD_START")
+        .then(pl.col("discovery_score") * 2.0)  # Extra boost for cold-start
+        .otherwise(pl.col("discovery_score") * 0.8)
+        .alias("feat_discovery_weighted"),
+        
+        # Serendipity score: Discovery items for repurchasers (surprise!)
+        pl.when(
+            (pl.col("user_intent") == "REPURCHASER") &
+            (pl.col("candidate_type") == "DISCOVERY")
+        )
+        .then(pl.lit(1.5))
+        .otherwise(pl.lit(0.0))
+        .alias("feat_serendipity_bonus")
+    ])
+    
+    return features
 # ============================================================================
 # 2. DIVERSITY FEATURES (Optimized)
 # ============================================================================
@@ -410,3 +515,115 @@ def compute_interaction_quality(
             ).alias("complementarity_bonus")
         ])
     )
+# ============================================================================
+# SOLUTION 2: BETTER FEATURE BALANCING
+# ============================================================================
+
+
+def build_features_robust(
+    candidates: pl.LazyFrame,
+    transactions: pl.LazyFrame,
+    items: pl.LazyFrame,
+    hist_start: datetime,
+    hist_end: datetime,
+    verbose: bool = True
+) -> pl.LazyFrame:
+    """
+    MODIFIED: Include comprehensive repurchase features
+    """
+    if verbose:
+        print(f"\n[Stage 2] Building Features with Repurchase Support...")
+    
+    days_in_window = max((hist_end - hist_start).days, 1)
+    
+    # 1. Regularized Popularity
+    item_pop = compute_regularized_popularity(
+        transactions, hist_start, hist_end, verbose=verbose
+    )
+    
+    # 2. Diversity Features
+    diversity_feats = compute_diversity_features(
+        transactions, items, candidates, 
+        hist_start, hist_end, verbose=verbose
+    )
+    
+    # 3. Temporal Features
+    temporal_feats = compute_temporal_features(
+        transactions, candidates,
+        hist_start, hist_end, verbose=verbose
+    )
+    
+    # 4. Interaction Quality
+    quality_feats = compute_interaction_quality(
+        transactions, items, candidates,
+        hist_start, hist_end, verbose=verbose
+    )
+    
+    # 5. Repurchase Features
+    repurchase_feats = compute_repurchase_features(
+        transactions, candidates,
+        hist_start, hist_end, verbose=verbose
+    )
+    
+    # 6. FIXED: User Stats - Filter by candidates first
+    target_users = candidates.select("customer_id").unique()
+    
+    user_daily_stats = (
+        transactions
+        .filter(
+            (pl.col("created_date") >= hist_start) & 
+            (pl.col("created_date") <= hist_end)
+        )
+        .join(target_users, on="customer_id", how="inner")  # ← FIX: Only compute for relevant users
+        .group_by("customer_id")
+        .agg([
+            (pl.len() / days_in_window).cast(pl.Float32).alias("user_daily_purchase_rate"),
+            pl.col("price").mean().cast(pl.Float32).alias("user_avg_spend"),
+            pl.col("item_id").n_unique().cast(pl.UInt32).alias("user_item_diversity")
+        ])
+        .with_columns([
+            pl.col("user_avg_spend").fill_null(0.0),
+            pl.col("user_item_diversity").fill_null(1)
+        ])
+    )
+    
+    # 7. MERGE ALL
+    features = (
+        candidates
+        .join(item_pop, on="item_id", how="left")
+        .join(diversity_feats, on=["customer_id", "item_id"], how="left")
+        .join(temporal_feats, on=["customer_id", "item_id"], how="left")
+        .join(quality_feats, on=["customer_id", "item_id"], how="left")
+        .join(repurchase_feats, on=["customer_id", "item_id"], how="left")
+        .join(user_daily_stats, on="customer_id", how="left")
+    )
+    
+    # 8. Final column selection with proper null handling
+    final_cols = [
+        # Candidate generation scores
+        "feat_cf_score", "feat_i2v_score", "feat_repurchase_score", "feat_pop_score",
+        "feat_cat_rank_score", "feat_trend_score",
+        # Popularity features
+        "smoothed_popularity", "log_popularity", "monthly_sales_rate",
+        # Diversity features
+        "exploration_score", "novelty_score", "category_entropy",
+        # Temporal features
+        "sales_momentum", "recent_acceleration",
+        # Quality features
+        "price_fit_score", "complementarity_bonus",
+        # User stats
+        "user_daily_purchase_rate", "user_avg_spend", "user_item_diversity",
+        # Repurchase features
+        "item_repurchase_rate", "user_repurchase_propensity", 
+        "feat_new_score",  # ← ADD THIS
+        "past_cnt", "days_since",
+        "purchase_regularity_score", "repurchase_composite_score"
+    ]
+        
+    output_cols = [pl.col("customer_id"), pl.col("item_id")]
+    for col in final_cols:
+        output_cols.append(
+            pl.col(col).fill_null(0.0).cast(pl.Float32).alias(col)
+        )
+    
+    return features.select(output_cols)
