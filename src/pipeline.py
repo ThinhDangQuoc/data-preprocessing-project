@@ -61,7 +61,7 @@ TRANSACTIONS_GLOB = f"{BASE_DIR}/dataset/sales_pers.purchase_history_daily_chunk
 ITEMS_PATH = f"{BASE_DIR}/dataset/sales_pers.item_chunk_0.parquet"
 USERS_GLOB = f"{BASE_DIR}/dataset/sales_pers.user_chunk*.parquet"
 GT_PKL_PATH = f"{BASE_DIR}/groundtruth.pkl"
-OUTPUT_DIR = f"{BASE_DIR}/outputs_improved"
+OUTPUT_DIR = f"{BASE_DIR}/outputs"
 
 # Line 89 - UPDATE THIS
 ALL_SCORES = [
@@ -475,7 +475,126 @@ def build_history_dict(
     
     return hist_dict
 
-import numpy as np
+
+def predict_top_k(
+    model: XGBRanker,
+    lf: pl.LazyFrame,
+    features: List[str],
+    gt_users: List[Any],
+    top_k: int = 10,
+    batch_size: int = 500_000,  # Process 500k rows at a time (adjust based on RAM)
+    verbose: bool = True
+) -> Dict[Any, List[Any]]:
+    """
+    Optimized inference function.
+    
+    Strategy:
+    1. Materialize the relevant test features into memory ONCE.
+    2. Run XGBoost prediction in large vector batches.
+    3. Use Polars (Rust) to sort and extract top-k items efficiently.
+    """
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"Inference: Generating Predictions")
+        print(f"{'='*60}")
+        print("  [1/4] Materializing test data...")
+
+    # -------------------------------------------------------------------------
+    # 1. Materialize Data (The bottleneck breaker)
+    # -------------------------------------------------------------------------
+    # We filter for only the users we need to predict for, then collect.
+    # This executes the Feature Engineering DAG exactly once.
+    df_test = (
+        lf
+        .filter(pl.col("customer_id").is_in(gt_users))
+        .select(["customer_id", "item_id"] + features)
+        .collect()
+    )
+    
+    total_rows = len(df_test)
+    if verbose:
+        print(f"  [2/4] Predicting on {total_rows:,} candidate rows...")
+        print(f"        (Batch size: {batch_size:,})")
+
+    if total_rows == 0:
+        return {}
+
+    # -------------------------------------------------------------------------
+    # 2. Vectorized Prediction
+    # -------------------------------------------------------------------------
+    # We pre-allocate a numpy array for scores to avoid memory fragmentation
+    all_scores = np.zeros(total_rows, dtype=np.float32)
+    
+    # Iterate through the DataFrame in chunks (CPU-bound)
+    # This prevents creating a massive NumPy array copy of the features if RAM is tight
+    for i in range(0, total_rows, batch_size):
+        end = min(i + batch_size, total_rows)
+        
+        # Slice feature columns and convert to numpy
+        # Note: We assume feature columns are floats. If not, this might copy.
+        X_batch = df_test[i:end].select(features).to_numpy()
+        
+        # Predict
+        all_scores[i:end] = model.predict(X_batch)
+        
+        # Periodic Garbage Collection for very large loops
+        if i % (batch_size * 5) == 0:
+            gc.collect()
+
+    # -------------------------------------------------------------------------
+    # 3. Efficient Top-K Extraction
+    # -------------------------------------------------------------------------
+    if verbose:
+        print("  [3/4] Ranking and extracting Top-K items...")
+
+    # Attach scores and sort
+    # Polars is much faster at "Sort-Group-Head" than Python dictionaries
+    top_k_df = (
+        df_test
+        .select(["customer_id", "item_id"])          # Drop feature cols to save RAM
+        .with_columns(pl.Series("score", all_scores)) # Attach predictions
+        .sort(["customer_id", "score"], descending=[False, True]) # Sort by User then Score
+        .group_by("customer_id", maintain_order=True) # Group
+        .head(top_k)                                  # Take top K
+    )
+
+    # -------------------------------------------------------------------------
+    # 4. Convert to Output Dictionary
+    # -------------------------------------------------------------------------
+    if verbose:
+        print("  [4/4] Formatting results...")
+
+    results = {}
+    
+    # Aggregating to list is the fastest way to bridge Polars -> Python Dict
+    # This results in: customer_id | [item1, item2, item3...]
+    final_agg = (
+        top_k_df
+        .group_by("customer_id", maintain_order=True)
+        .agg(pl.col("item_id"))
+    )
+
+    # Fast iteration over rows
+    for row in final_agg.iter_rows():
+        results[row[0]] = row[1]  # row[0] is user_id, row[1] is list of items
+
+    # Fill in missing users (if any GT users had no candidates generated)
+    missing_count = 0
+    for user in gt_users:
+        if user not in results:
+            results[user] = []
+            missing_count += 1
+
+    if verbose:
+        print(f"  Done. Predictions generated for {len(results):,} users.")
+        if missing_count > 0:
+            print(f"  Warning: {missing_count} users had 0 candidates (returned empty list).")
+
+    # Clean up memory
+    del df_test, all_scores, top_k_df, final_agg
+    gc.collect()
+
+    return results
 
 def precision_at_k_customer(
     pred,
@@ -647,36 +766,46 @@ def predict_with_cold_start_fallback(
     return results
 
 # ============================================================================
-# MAIN PIPELINE
+# MODIFIED: MAIN PIPELINE
 # ============================================================================
 
+# ... (Previous imports and functions remain the same) ...
+
 # ============================================================================
-# FIXED: MAIN PIPELINE
+# MODIFIED: MAIN PIPELINE
 # ============================================================================
 
 def main():
     """
-    FIXED: Complete pipeline with all bug fixes
+    Modified pipeline using historical GT for test window
     """
+    
     # SETTINGS
     RECREATE_PREPROCESSED = True
     PROCESSED_DIR = f"{BASE_DIR}/processed_v1"
     TRAIN_SAMPLE_RATE = 0.2
     VAL_SAMPLE_RATE = 0.2
-    TEST_SAMPLE_RATE = 1.0  # Always 1.0 for test
+    TEST_SAMPLE_RATE = 1.0
+    
+    # FILE PATHS
+    HISTORICAL_GT_PATH = f"{BASE_DIR}/01-2025.pkl"  # ← Historical window
+    CURRENT_GT_PATH = f"{BASE_DIR}/final_groundtruth.pkl"     # ← Evaluation target
     
     print("="*60)
     print("RECOMMENDATION SYSTEM PIPELINE")
+    print("Using Historical GT as Test Window")
     print("="*60)
     
     # ========================================================================
-    # 1. Load Ground Truth
+    # 1. Load Ground Truth (02-2025.pkl)
     # ========================================================================
-    print("\n[1/8] Loading Ground Truth...")
-    with open(GT_PKL_PATH, 'rb') as f:
+    print("\n[1/8] Loading Ground Truth (02-2025)...")
+    with open(CURRENT_GT_PATH, 'rb') as f:
         gt = pickle.load(f)
-    gt_user_ids = list(gt.keys())
-    print(f"  GT Users: {len(gt_user_ids):,}")
+    
+    # FIX 1: Ensure GT IDs are strings to match the casted Parquet data later
+    gt_user_ids = [str(k) for k in gt.keys()]
+    print(f"  GT Users (Feb 2025): {len(gt_user_ids):,}")
     
     # ========================================================================
     # 2. Initialize Raw Data
@@ -688,16 +817,60 @@ def main():
     print("  ✓ Data loaded (lazy)")
     
     # ========================================================================
-    # 3. Create Splits (FIXED: Now function exists)
+    # 3. Create Splits (Modified with Historical GT)
     # ========================================================================
     print("\n[3/8] Creating Time Splits...")
-    ROBUST_SPLITS = create_realistic_splits(raw_trans)
+    ROBUST_SPLITS = create_realistic_splits_with_historical_gt(
+        raw_trans,
+        historical_gt_path=HISTORICAL_GT_PATH,
+        verbose=True
+    )
+
+    # ========================================================================
+    # 6. Process TEST Split (WITH HISTORICAL GT)
+    # ========================================================================
+    print("\n[6/8] Processing TEST Split (Using Historical GT)...")
     
-    for split_name, config in ROBUST_SPLITS.items():
-        print(f"  {split_name}:")
-        print(f"    History: {config['hist_start'].date()} → {config['hist_end'].date()}")
-        if config['target_start']:
-            print(f"    Target:  {config['target_start'].date()} → {config['target_end'].date()}")
+    # FIX 2: Cast 'customer_id' to String BEFORE filtering
+    # The error happened here because raw_users['customer_id'] was Int32 
+    # but gt_user_ids was List[String].
+    gt_users_only = (
+        raw_users
+        .with_columns(pl.col("customer_id").cast(pl.Utf8))  # <--- CRITICAL FIX
+        .filter(pl.col("customer_id").is_in(gt_user_ids))
+    )
+    
+    # Use modified preprocessing
+    te_trans, te_items, te_users = get_preprocessed_data_with_historical_gt(
+        "test", 
+        ROBUST_SPLITS['test'], 
+        raw_trans, 
+        raw_items, 
+        gt_users_only,  # Now contains correct types
+        output_dir=PROCESSED_DIR, 
+        recreate=RECREATE_PREPROCESSED,
+        sample_rate=TEST_SAMPLE_RATE,
+        verbose=True
+    )
+    
+    # Build test dataset with MODIFIED config
+    test_config_modified = {
+        'hist_start': datetime(2024, 12, 1),   # Last 2 months before Jan 2025
+        'hist_end': datetime(2025, 1, 31),     # End of historical GT period
+        'target_start': None,
+        'target_end': None
+    }
+    
+    test_ds = build_dataset_v2(
+        "test", 
+        test_config_modified,  # Use modified config
+        te_trans, 
+        te_items, 
+        te_users, 
+        is_train=False,
+        verbose=True,
+        allow_repurchase=True
+    )
     
     # ========================================================================
     # 4. Process TRAIN Split
@@ -720,11 +893,11 @@ def main():
         seed=42,
         do_recall_check=True,
         recall_k=80,
-        allow_repurchase=True  # NEW: Allow repurchases
+        allow_repurchase=True
     )
     
     # ========================================================================
-    # 5. Process VAL Split (FIXED: Now gets labels)
+    # 5. Process VAL Split
     # ========================================================================
     print("\n[5/8] Processing VAL Split...")
     v_trans, v_items, v_users = get_preprocessed_data(
@@ -743,68 +916,34 @@ def main():
         verbose=True,
         do_recall_check=True,
         recall_k=80,
-        allow_repurchase=True  # NEW: Allow repurchases
+        allow_repurchase=True
     )
     val_ds = sample_validation_data(
         val_ds, 
         target_positive_rate=0.05,
         verbose=True
     )
-    # ========================================================================
-    # 6. Process TEST Split
-    # ========================================================================
-    print("\n[6/8] Processing TEST Split...")
-    
-    # Filter to GT users only
-    gt_users_only = raw_users.filter(pl.col("customer_id").is_in(gt_user_ids))
-    
-    te_trans, te_items, te_users = get_preprocessed_data(
-        "test", ROBUST_SPLITS['test'], 
-        raw_trans, raw_items, gt_users_only,
-        output_dir=PROCESSED_DIR, 
-        recreate=RECREATE_PREPROCESSED,
-        sample_rate=TEST_SAMPLE_RATE  # Always 1.0
-    )
-    
-    test_ds = build_dataset_v2(
-        "test", 
-        ROBUST_SPLITS['test'], 
-        te_trans, te_items, te_users, 
-        is_train=False,
-        verbose=True,
-        allow_repurchase=True  # NEW: Allow repurchases
-    )
-    
     
     # ========================================================================
-    # 7. Train Model
+    # 7. Train Model (Same as before)
     # ========================================================================
     print("\n[7/8] Training Model...")
     
-    # Prepare training data
     X_train, y_train, g_train, feats, _ = prepare_for_xgb_v2(
-        train_ds, 
-        is_train=True,
-        verbose=True
+        train_ds, is_train=True, verbose=True
     )
     
-    # Prepare validation data (FIXED: Now has labels)
     X_val, y_val, g_val, _, _ = prepare_for_xgb_v2(
-        val_ds, 
-        is_train=False,  # Keep all data, no sampling
-        verbose=True,
-        filter_no_positive_users=True,   # <- important
-
+        val_ds, is_train=False, verbose=True, filter_no_positive_users=True
     )
     
-    # Train
     model = train_model(
         X_train, y_train, g_train, 
         X_val, y_val, g_val,
         verbose=True
     )
     model.save_model(f"{OUTPUT_DIR}/xgb_ranker.json")
-    # Clean up training data
+    
     del X_train, y_train, g_train, X_val, y_val, g_val, train_ds, val_ds
     gc.collect()
     
@@ -812,60 +951,51 @@ def main():
     # 8. Predict & Evaluate
     # ========================================================================
     print("\n[8/8] Generating Predictions...")
-    # Create cold-start fallback
+    
     cold_start_items = create_cold_start_recommendations(
         te_items, te_trans,
-        ROBUST_SPLITS['test']['hist_start'],
-        ROBUST_SPLITS['test']['hist_end'],
+        test_config_modified['hist_start'],
+        test_config_modified['hist_end'],
         verbose=True
     )
-
     
-    # Build history for filtering
+    # Build history from HISTORICAL GT + transaction data
     hist_dict = build_history_dict(
         te_trans,
-        ROBUST_SPLITS['test']['hist_start'],
-        ROBUST_SPLITS['test']['hist_end'],
+        test_config_modified['hist_start'],
+        test_config_modified['hist_end'],
         verbose=True
     )
+    
     preds = predict_with_cold_start_fallback(
         model, test_ds, feats, gt_user_ids,
         hist_dict, cold_start_items,
         top_k=10, verbose=True
     )
-   
+    
     # Evaluate
     print("\n" + "="*60)
     print("EVALUATION")
     print("="*60)
     
-    p_at_10, missing_users, stats = precision_at_k(
-        pred=preds,
-        gt=gt,
-        hist=hist_dict,
-        filter_bought_items=False,  # CHANGED: Allow repurchases
-        K=10,
-        verbose=True
+    # Make sure to handle keys as matching types (String) in evaluation
+    gt_str_keys = {str(k): v for k, v in gt.items()}
+    
+    p_at_10_no_filter, _, stats_no_filter = precision_at_k(
+        pred=preds, gt=gt_str_keys, hist=hist_dict,
+        filter_bought_items=False, K=10, verbose=True
     )
-    p_at_10, missing_users, stats = precision_at_k(
-        pred=preds,
-        gt=gt,
-        hist=hist_dict,
-        filter_bought_items=True,  # CHANGED: Allow repurchases
-        K=10,
-        verbose=True
+    
+    p_at_10_filtered, _, stats_filtered = precision_at_k(
+        pred=preds, gt=gt_str_keys, hist=hist_dict,
+        filter_bought_items=True, K=10, verbose=True
     )
+    
     p_at_10_customer, cold_start_users, stats_customer = precision_at_k_customer(
-        pred=preds,
-        gt=gt,
-        hist=hist_dict,
-        filter_bought_items=False,  # CHANGED: Allow repurchases
-        K=10,
-        return_stats=True
+        pred=preds, gt=gt_str_keys, hist=hist_dict,
+        filter_bought_items=False, K=10, return_stats=True
     )
-
-
-
+    
     # ========================================================================
     # 9. Save Results
     # ========================================================================
@@ -875,12 +1005,19 @@ def main():
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    # Save evaluation
     eval_results = {
-        'precision_at_10': float(p_at_10),
-        'statistics': stats,
-        'n_missing_users': len(missing_users),
-        'sample_missing_users': [str(u) for u in missing_users[:10]]
+        'precision_at_10': {
+            'with_repurchase': float(p_at_10_no_filter),
+            'without_repurchase': float(p_at_10_filtered),
+            'customer_metric': float(p_at_10_customer)
+        },
+        'statistics': {
+            'no_filter': stats_no_filter,
+            'filtered': stats_filtered,
+            'customer': stats_customer
+        },
+        'historical_gt_used': HISTORICAL_GT_PATH,
+        'evaluation_gt_used': CURRENT_GT_PATH
     }
     
     eval_path = f"{OUTPUT_DIR}/evaluation.json"
@@ -888,12 +1025,10 @@ def main():
         json.dump(eval_results, f, indent=2)
     print(f"✓ Evaluation saved: {eval_path}")
     
-    # Save predictions
     output_path = f"{OUTPUT_DIR}/predictions.json"
     with open(output_path, "w") as f:
         json.dump({str(k): v for k, v in preds.items()}, f, indent=2)
     print(f"✓ Predictions saved: {output_path}")
-    print(f"  Total: {len(preds):,} users")
     
     # Feature importance
     print("\n" + "="*60)
@@ -902,9 +1037,7 @@ def main():
     
     importance = model.get_booster().get_score(importance_type='gain')
     sorted_importance = sorted(
-        importance.items(), 
-        key=lambda x: x[1], 
-        reverse=True
+        importance.items(), key=lambda x: x[1], reverse=True
     )
     
     for feat, score in sorted_importance[:10]:
@@ -915,8 +1048,8 @@ def main():
     print("\n" + "="*60)
     print("PIPELINE COMPLETE!")
     print("="*60)
-    print(f"Final Precision@10: {p_at_10:.4f}")
-
+    print(f"Final Precision@10 (with repurchase): {p_at_10_no_filter:.4f}")
+    print(f"Final Precision@10 (no repurchase):   {p_at_10_filtered:.4f}")
 
 if __name__ == "__main__":
     main()

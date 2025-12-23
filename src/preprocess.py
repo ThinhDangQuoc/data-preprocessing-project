@@ -6,7 +6,7 @@ Key Improvements:
 3. Item freshness decay
 4. Remove leaky features
 """
-
+import pickle
 import polars as pl
 from datetime import datetime, timedelta
 import numpy as np
@@ -492,7 +492,322 @@ def preprocess_pipeline(
         users_final = users_stratified
     
     return trans_clean, items_quality, users_final
+    
+    
+# ============================================================================
+# MODIFIED: TEST SPLIT WITH HISTORICAL GROUND TRUTH AS HISTORY
+# ============================================================================
 
+def load_historical_transactions_from_pickle(
+    pickle_path: str,
+    verbose: bool = True
+) -> pl.LazyFrame:
+    """
+    Load transaction data from pickle file (01-2025.pkl format)
+    
+    Args:
+        pickle_path: Path to historical transaction pickle (e.g., "01-2025.pkl")
+    
+    Returns:
+        LazyFrame with transaction data (same format as parquet files)
+    """
+    if verbose:
+        print(f"\n[Loading Historical Transactions] {pickle_path}")
+    
+    with open(pickle_path, 'rb') as f:
+        hist_data = pickle.load(f)
+    
+    # Convert to DataFrame
+    import pandas as pd
+    
+    if isinstance(hist_data, dict):
+        # Dict of Series → DataFrame
+        hist_pd = pd.DataFrame(hist_data)
+    elif isinstance(hist_data, pd.DataFrame):
+        hist_pd = hist_data
+    else:
+        raise ValueError(f"Unexpected format in {pickle_path}: {type(hist_data)}")
+    
+    # Convert to Polars
+    hist_df = pl.from_pandas(hist_pd).lazy()
+    
+    # Convert timestamp to created_date if needed
+    if 'timestamp' in hist_df.columns and 'created_date' not in hist_df.columns:
+        hist_df = hist_df.with_columns([
+            pl.from_epoch(pl.col("timestamp"), time_unit="s")
+            .alias("created_date")
+        ])
+    
+    # CRITICAL FIX: Cast customer_id and item_id to String for consistency
+    if 'customer_id' in hist_df.columns:
+        hist_df = hist_df.with_columns([
+            pl.col("customer_id").cast(pl.Utf8).alias("customer_id")
+        ])
+    
+    if 'item_id' in hist_df.columns:
+        hist_df = hist_df.with_columns([
+            pl.col("item_id").cast(pl.Utf8).alias("item_id")
+        ])
+    
+    if verbose:
+        sample = hist_df.select([
+            pl.col("customer_id").n_unique().alias("n_users"),
+            pl.len().alias("n_transactions")
+        ]).collect()
+        print(f"  Users: {sample['n_users'][0]:,}")
+        print(f"  Transactions: {sample['n_transactions'][0]:,}")
+    
+    return hist_df
+
+
+def create_realistic_splits_with_historical_gt(
+    transactions: pl.LazyFrame,
+    historical_gt_path: str = None,
+    verbose: bool = True
+):
+    """
+    Modified split creation that uses historical GT for test window
+    
+    Args:
+        transactions: Main transaction data
+        historical_gt_path: Path to 01-2025.pkl (or None to use transaction data)
+    """
+    
+    SPLITS = {
+        'train': {
+            'hist_start': datetime(2024, 9, 1),
+            'hist_end': datetime(2024, 10, 31),
+            'target_start': datetime(2024, 11, 5),
+            'target_end': datetime(2024, 11, 14)
+        },
+        'val': {
+            'hist_start': datetime(2024, 10, 1),
+            'hist_end': datetime(2024, 11, 30),
+            'target_start': datetime(2024, 12, 5),
+            'target_end': datetime(2024, 12, 14)
+        },
+        'test': {
+            # Use historical GT file if provided
+            'use_historical_gt': historical_gt_path is not None,
+            'historical_gt_path': historical_gt_path,
+            
+            # Fallback to transaction data if no GT
+            'hist_start': datetime(2024, 11, 1),
+            'hist_end': datetime(2024, 12, 31),
+            
+            # Target is Feb 2025 (from new GT file)
+            'target_start': None,  # From 02-2025.pkl
+            'target_end': None
+        }
+    }
+    
+    if verbose:
+        print("\n[Split Configuration]")
+        for name, cfg in SPLITS.items():
+            print(f"\n{name.upper()}:")
+            if name == 'test' and cfg.get('use_historical_gt'):
+                print(f"  History: From GT file {cfg['historical_gt_path']}")
+                print(f"  Target:  From current GT file (02-2025.pkl)")
+            else:
+                print(f"  History: {cfg['hist_start'].date()} → {cfg['hist_end'].date()}")
+                if cfg.get('target_start'):
+                    print(f"  Target:  {cfg['target_start'].date()} → {cfg['target_end'].date()}")
+    
+    return SPLITS
+
+
+# ============================================================================
+# MODIFIED: PREPROCESSING WITH HISTORICAL GT SUPPORT
+# ============================================================================
+
+def get_preprocessed_data_with_historical_gt(
+    split_name: str,
+    split_config: dict,
+    raw_trans: pl.LazyFrame,
+    raw_items: pl.LazyFrame,
+    raw_users: pl.LazyFrame,
+    output_dir: str,
+    recreate: bool = False,
+    sample_rate: float = 1.0,
+    verbose: bool = True
+):
+    """
+    Modified preprocessing that uses historical transaction pickle for test split
+    """
+    
+    # Check if we should use historical transactions
+    if split_name == 'test' and split_config.get('use_historical_gt'):
+        if verbose:
+            print(f"\n[Test Split] Using Historical Transaction File as History")
+        
+        # Load historical transactions from pickle
+        historical_trans = load_historical_transactions_from_pickle(
+            split_config['historical_gt_path'],
+            verbose=verbose
+        )
+        
+        # CRITICAL FIX: Cast raw_users customer_id to String to match historical_trans
+        raw_users_casted = raw_users.with_columns([
+            pl.col("customer_id").cast(pl.Utf8).alias("customer_id")
+        ])
+        
+        # Also cast raw_items if needed
+        raw_items_casted = raw_items
+        if 'item_id' in raw_items.columns:
+            raw_items_casted = raw_items.with_columns([
+                pl.col("item_id").cast(pl.Utf8).alias("item_id")
+            ])
+        
+        # Use ONLY the historical transactions (don't merge with raw_trans)
+        # This ensures we're only using January 2025 data as history
+        trans_clean = preprocess_transactions(
+            historical_trans,
+            raw_items_casted,
+            hist_end=datetime(2025, 1, 31),  # End of January
+            verbose=verbose
+        )
+        
+        # Filter items based on historical period
+        items_clean = filter_quality_items(
+            historical_trans,
+            raw_items_casted,
+            hist_start=datetime(2025, 1, 1),   # All of January
+            hist_end=datetime(2025, 1, 31),
+            verbose=verbose
+        )
+        
+        # Stratify users based on historical transactions
+        users_clean = stratify_users_by_activity(
+            historical_trans,
+            raw_users_casted,  # Use casted version
+            hist_start=datetime(2025, 1, 1),
+            hist_end=datetime(2025, 1, 31),
+            verbose=verbose
+        )
+        
+        return trans_clean, items_clean, users_clean
+    
+    else:
+        # Original preprocessing for train/val
+        return get_preprocessed_data(
+            split_name, split_config,
+            raw_trans, raw_items, raw_users,
+            output_dir, recreate, sample_rate, verbose
+        )
+
+
+"""
+FIX: Ground Truth Pickle Loading
+The issue is that the pickle contains a DataFrame with column headers,
+not a clean dict of user_id -> items
+"""
+
+import pickle
+import pandas as pd
+
+def load_ground_truth_fixed(pickle_path: str, verbose: bool = True):
+    """
+    Properly load ground truth from pickle file
+    
+    Expected formats:
+    1. Dict[user_id -> list of items]
+    2. Dict[user_id -> {'list_items': [...]}]
+    3. DataFrame with columns: customer_id, item_id (or list_items)
+    """
+    
+    if verbose:
+        print(f"\n[Loading GT] {pickle_path}")
+    
+    with open(pickle_path, 'rb') as f:
+        raw_data = pickle.load(f)
+    
+    if verbose:
+        print(f"  Type: {type(raw_data)}")
+        if isinstance(raw_data, dict):
+            first_key = list(raw_data.keys())[0]
+            print(f"  First key: '{first_key}' (type: {type(first_key)})")
+    
+    # Case 1: It's a DataFrame
+    if isinstance(raw_data, pd.DataFrame):
+        if verbose:
+            print(f"  Format: DataFrame")
+            print(f"  Columns: {raw_data.columns.tolist()}")
+        
+        # Check if it has the expected columns
+        if 'customer_id' in raw_data.columns:
+            if 'list_items' in raw_data.columns:
+                # Format: customer_id | list_items
+                gt_dict = dict(zip(
+                    raw_data['customer_id'].astype(str).str.strip(),
+                    raw_data['list_items']
+                ))
+            elif 'item_id' in raw_data.columns:
+                # Format: customer_id | item_id (need to group)
+                gt_dict = (
+                    raw_data
+                    .groupby('customer_id')['item_id']
+                    .apply(list)
+                    .to_dict()
+                )
+                # Ensure string keys
+                gt_dict = {str(k).strip(): v for k, v in gt_dict.items()}
+            else:
+                raise ValueError(f"DataFrame missing expected columns. Has: {raw_data.columns.tolist()}")
+        else:
+            raise ValueError(f"DataFrame missing 'customer_id' column. Has: {raw_data.columns.tolist()}")
+    
+    # Case 2: It's already a dict
+    elif isinstance(raw_data, dict):
+        # Check if first key looks like a column name
+        first_key = list(raw_data.keys())[0]
+        
+        if first_key in ['customer_id', 'item_id', 'list_items']:
+            # BUG: This is actually a dict of Series (column-oriented format)
+            if verbose:
+                print(f"  Format: Dict of Series (converting to DataFrame)")
+            
+            df = pd.DataFrame(raw_data)
+            
+            # Now process as DataFrame
+            if 'customer_id' in df.columns and 'list_items' in df.columns:
+                gt_dict = dict(zip(
+                    df['customer_id'].astype(str).str.strip(),
+                    df['list_items']
+                ))
+            elif 'customer_id' in df.columns and 'item_id' in df.columns:
+                gt_dict = (
+                    df.groupby('customer_id')['item_id']
+                    .apply(list)
+                    .to_dict()
+                )
+                gt_dict = {str(k).strip(): v for k, v in gt_dict.items()}
+            else:
+                raise ValueError(f"Cannot parse dict-of-series format. Columns: {df.columns.tolist()}")
+        
+        else:
+            # This is already in correct format: user_id -> items
+            if verbose:
+                print(f"  Format: Dict (user_id -> items)")
+            
+            # Just ensure string keys
+            gt_dict = {str(k).strip(): v for k, v in raw_data.items()}
+    
+    else:
+        raise ValueError(f"Unexpected ground truth format: {type(raw_data)}")
+    
+    # Validate
+    if not gt_dict:
+        raise ValueError("Ground truth is empty after parsing!")
+    
+    first_user = list(gt_dict.keys())[0]
+    first_items = gt_dict[first_user]
+    
+    if verbose:
+        print(f"  ✓ Loaded {len(gt_dict):,} users")
+        print(f"  Sample user: '{first_user}'")
+        print(f"  Sample items: {first_items[:3] if len(first_items) > 3 else first_items}")
+    
+    return gt_dict
 
 # ============================================================================
 # USAGE EXAMPLE
